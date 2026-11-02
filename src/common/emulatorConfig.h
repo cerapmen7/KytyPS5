@@ -93,6 +93,7 @@ struct ConfigOptions {
 	bool                   readback_tiled_images       = false;
 	bool                   readback_storage_images     = false;
 	bool                   sync_raw_image_buffers      = false;
+	bool                   batch_hot_readbacks         = false;
 	bool                   tessellation_enabled        = false;
 	bool                   occlusion_queries_enabled   = true;
 	bool                   relaxed_shader_float        = false;
@@ -169,6 +170,9 @@ bool ReadbackLinearImagesEnabled();
 bool ReadbackTiledImagesEnabled();
 bool ReadbackStorageImagesEnabled();
 bool SyncRawImageBuffersEnabled();
+// Makes a fault readback that waits for the GPU also read back GPU-written bytes of buffers that
+// recently faulted.
+bool BatchHotReadbacksEnabled();
 bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
 bool RelaxedShaderFloatEnabled();
