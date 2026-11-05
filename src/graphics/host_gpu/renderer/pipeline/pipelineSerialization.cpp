@@ -81,9 +81,9 @@ template <class S, class Key> void IoKey(S& io, Key& key) {
 
 template <class S, class Module> void IoModule(S& io, Module& stage) {
 	// The handle comes from the SPIR-V; stored programs have no function code.
-	auto& [id, handle, info, specialization, function_code, vertex_formats, descriptor_buffers,
+	auto& [id, handle, info, specialization, function_code, descriptor_buffers,
 	       rect_parameters, mesh_task] = stage;
-	IoAll(io, id, info, specialization, vertex_formats, rect_parameters, mesh_task);
+	IoAll(io, id, info, specialization, descriptor_buffers, rect_parameters, mesh_task);
 }
 
 } // namespace

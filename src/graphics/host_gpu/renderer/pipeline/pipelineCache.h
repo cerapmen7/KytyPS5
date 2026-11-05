@@ -86,8 +86,9 @@ struct PipelineVertexInputState {
 		uint8_t  instance = 0;
 	};
 	struct Attribute {
-		uint32_t offset  = 0;
-		uint8_t  binding = 0;
+		uint32_t   offset  = 0;
+		vk::Format format  = vk::Format::eUndefined;
+		uint8_t    binding = 0;
 	};
 
 	std::array<Binding, ShaderVertexInputInfo::RES_MAX>   bindings {};
@@ -120,8 +121,6 @@ struct ShaderModule {
 	ShaderRecompiler::IR::CompiledShaderInfo     info;
 	ShaderRecompiler::IR::ResourceSpecialization specialization;
 	std::vector<uint32_t>                        function_code;
-	// VS or LS: the host format of each vertex input attribute.
-	std::vector<vk::Format>                      vertex_formats;
 	// Buffers that own a native descriptor slot, in metadata order.
 	std::vector<uint32_t>                        descriptor_buffers;
 	// Rectangle-list PS: the parameters it reads.
