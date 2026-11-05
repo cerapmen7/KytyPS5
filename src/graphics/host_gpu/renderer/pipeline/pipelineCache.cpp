@@ -278,15 +278,20 @@ bool PipelineCache::Program::RefreshCallSource(const ShaderRecompiler::IR::SrtRu
 
 template <bool HasCalls>
 ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
+<<<<<<< HEAD
                                                  uint32_t push_data_cursor) {
 	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::MatRes);
+=======
+                                                 uint32_t push_data_cursor,
+                                                 uint32_t push_data_ceiling) {
+>>>>>>> 88e94686 (shader: place vertex-stage push data at the top of the push block)
 	EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
 	                                                    specialization));
 	for (auto& candidate: modules) {
 		const auto& layout = candidate.info.bindings;
-		if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
-		        push_data_cursor, layout.ShaderDataDwords()) ||
-		    candidate.specialization != specialization) {
+		const auto  start  = ShaderRecompiler::IR::PushData::StartFor(
+		    candidate.info.stage, push_data_cursor, layout.ShaderDataDwords(), push_data_ceiling);
+		if (layout.push_data_start_dword != start || candidate.specialization != specialization) {
 			continue;
 		}
 		if constexpr (HasCalls) {
@@ -300,14 +305,15 @@ ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::Srt
 ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& key,
                                            ShaderRecompiler::CompileOptions  options,
                                            ShaderRecompiler::TranslateResult translated,
-                                           uint32_t                          push_data_cursor) {
+                                           uint32_t push_data_cursor, uint32_t push_data_ceiling) {
 	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::ShadersCompiled,
 	                                         Common::DebugCounters::Counter::ShaderCompileNs,
 	                                         Common::DebugCounters::Peak::ShaderCompileNs);
 	const auto profile = SpirvProfile(m_graphics);
 	options.profile    = &profile;
-	auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
-	                                               program.specialization, push_data_cursor);
+	auto result =
+	    ShaderRecompiler::CompileProgram(std::move(translated), options, program.specialization,
+	                                     push_data_cursor, push_data_ceiling);
 	auto info = std::move(result.program).TakeCompiledInfo();
 
 	// The same inputs give the same module id across runs.
@@ -355,7 +361,8 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 
 template <typename InputInfo>
 const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputInfo& input_info,
-                                              uint32_t& push_data_cursor) {
+                                              uint32_t& push_data_cursor,
+                                              uint32_t  push_data_ceiling) {
 	const auto user_data = std::span(params.user_data).first(params.user_data_count);
 	ShaderRecompiler::IR::SrtRuntime runtime {
 	    .user_data                  = user_data,
@@ -398,7 +405,9 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	}();
 	const auto bind = [&](const ShaderModule& module) {
 		input_info.stage = {.module = &module, .resources = &entry->second.resources};
-		module.info.bindings.AdvancePushData(push_data_cursor);
+		if constexpr (!std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			module.info.bindings.AdvancePushData(push_data_cursor);
+		}
 		return &module;
 	};
 	bool source_changed = false;
@@ -408,9 +417,16 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		ShaderModule* module = nullptr;
 		if (cached.call_source) {
 			source_changed = cached.RefreshCallSource(runtime);
+<<<<<<< HEAD
 			if (!source_changed) module = cached.template FindModule<true>(runtime, push_data_cursor);
 		} else {
 			module = cached.template FindModule<false>(runtime, push_data_cursor);
+=======
+			if (!source_changed)
+				module = cached.FindModule<true>(runtime, push_data_cursor, push_data_ceiling);
+		} else {
+			module = cached.FindModule<false>(runtime, push_data_cursor, push_data_ceiling);
+>>>>>>> 88e94686 (shader: place vertex-stage push data at the top of the push block)
 		}
 		if (module != nullptr) return bind(*module);
 	}
@@ -459,12 +475,17 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		    program.resource_plan, runtime, program.resources, program.specialization));
 	} else if (source_changed) {
 		entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+<<<<<<< HEAD
 		if (const auto* module = entry->second.template FindModule<true>(runtime, push_data_cursor)) {
+=======
+		if (const auto* module =
+		        entry->second.FindModule<true>(runtime, push_data_cursor, push_data_ceiling)) {
+>>>>>>> 88e94686 (shader: place vertex-stage push data at the top of the push block)
 			return bind(*module);
 		}
 	}
 	return bind(CompileModule(entry->second, entry->first, options, std::move(translated),
-	                          push_data_cursor));
+	                          push_data_cursor, push_data_ceiling));
 }
 
 PipelineCache::PipelineCache(GraphicContext&                         graphics,
@@ -868,8 +889,13 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		}
 		state.mrt_mask &= color_output_mask;
 	}
+	uint32_t push_data_ceiling = ShaderRecompiler::IR::PushData::DwordCount;
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
-		GetProgram(vertex_params[i], vertex_info[i], push_data_cursor);
+		const auto* module =
+		    GetProgram(vertex_params[i], vertex_info[i], push_data_cursor, push_data_ceiling);
+		if (module != nullptr && module->info.bindings.UsesPushData()) {
+			push_data_ceiling = module->info.bindings.push_data_start_dword;
+		}
 	}
 }
 
