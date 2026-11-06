@@ -9,6 +9,8 @@
 
 namespace Profiler {
 
+#ifdef TRACY_ENABLE
+
 void SetThreadName(const char* name) {
 	if (tracy::ProfilerAvailable() && name != nullptr) {
 		tracy::SetThreadName(name);
@@ -31,5 +33,17 @@ void Shutdown() {
 		tracy::ShutdownProfiler();
 	}
 }
+
+#else
+
+void SetThreadName(const char* name) {
+	(void)name;
+}
+
+void Initialize() {}
+
+void Shutdown() {}
+
+#endif
 
 } // namespace Profiler

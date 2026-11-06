@@ -26,6 +26,7 @@
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -121,11 +122,16 @@ struct ShaderModule {
 	std::vector<uint32_t>                        function_code;
 	// VS or LS: the host format of each vertex input attribute.
 	std::vector<vk::Format>                      vertex_formats;
+	// Buffers that own a native descriptor slot, in metadata order.
+	std::vector<uint32_t>                        descriptor_buffers;
 	// Rectangle-list PS: the parameters it reads.
 	std::vector<RectListParameter>               rect_parameters;
 	// Indirect mesh draw: a task shader reads the records and launches the groups.
 	bool                                         mesh_task = false;
 };
+
+// Rebuilds the list of buffers with a native descriptor slot after compilation or loading.
+void UpdateShaderModuleDescriptorBuffers(ShaderModule& module);
 
 // A draw's topology, shader stages (from PipelineCache::GetGraphicsPrograms) and targets.
 struct DrawRenderState {
@@ -233,7 +239,12 @@ private:
 
 	// Variants of one source share a bucket; ProgramKey equality compares the state.
 	struct ProgramKeyHash {
-		std::size_t operator()(const ProgramKey& key) const { return key.hash; }
+		std::size_t operator()(const ProgramKey& key) const {
+			const uint64_t seed = key.hash ^ (static_cast<uint64_t>(key.stage) << 56u) ^
+			                      key.user_data_count;
+			return XXH3_64bits_withSeed(key.static_state.data(),
+			                            key.static_state.size() * sizeof(uint32_t), seed);
+		}
 	};
 
 	struct GraphicsPipelineKeyHash {

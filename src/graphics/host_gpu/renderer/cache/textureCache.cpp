@@ -37,6 +37,67 @@ constexpr uint64_t NumFramesBeforeRemoval = 16;
 // Largest GPU-written tiled image (in texels) that is written back to guest memory on submit.
 constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
 
+// A storage image can expose the whole tiled mip-tail block rather than one
+// logical mip. Its native pixels contain several disjoint mip rectangles.
+// PPSA04379: the reflection cube is uploaded once through this block view; not
+// recognizing it loses the small levels and makes reflections sample as gray.
+[[nodiscard]] int32_t MipTailBlockLayer(const ImageInfo& source, const ImageInfo& cube,
+                                        TileSurfaceLayout& layout) {
+	if (!source.IsCompatible(cube) || source.guest_format != cube.guest_format ||
+	    source.tile_mode != Prospero::TileMode::kStandard4KB ||
+	    cube.tile_mode != source.tile_mode || source.type != Prospero::ImageType::kColor2D ||
+	    cube.type != source.type || source.IsBlock() || source.IsDepth() ||
+	    source.HasMetadata() || cube.HasMetadata() || source.samples != 1 ||
+	    source.resources != ImageSubresources{1, 1} || cube.resources.levels <= 1 ||
+	    !source.data.Valid() || !cube.data.Valid() || source.data.address < cube.data.address ||
+	    source.data.End() > cube.data.End()) {
+		return -1;
+	}
+	TileSurfaceDescription surface {};
+	surface.format    = cube.guest_format;
+	surface.tile_mode = cube.tile_mode;
+	surface.width     = cube.extent.width;
+	surface.height    = cube.extent.height;
+	surface.levels    = cube.resources.levels;
+	surface.layers    = cube.resources.layers;
+	if (!TileGetTiledTextureLayout(surface, layout) || layout.first_tail_level == 0 ||
+	    layout.first_tail_level >= cube.resources.levels || layout.total_size != cube.data.size) {
+		return -1;
+	}
+	const auto& block = layout.texture.block;
+	const auto& first = source.mip_layout[0];
+	if (source.extent != vk::Extent3D{block.block_width, block.block_height, 1} ||
+	    source.data.size != block.block_size || source.pitch != block.block_width ||
+	    first.offset != 0 || first.size != block.block_size ||
+	    first.pitch != block.block_width || first.height != block.block_height) {
+		return -1;
+	}
+	const auto tail_offset = layout.mips[layout.first_tail_level].offset;
+	const auto delta       = source.data.address - cube.data.address;
+	if (delta < tail_offset || (delta - tail_offset) % layout.block_slice_size != 0) {
+		return -1;
+	}
+	const auto layer = (delta - tail_offset) / layout.block_slice_size;
+	if (layer >= cube.resources.layers || layer > INT32_MAX) {
+		return -1;
+	}
+	if (cube.resources.levels > 16u) {
+		return -1;
+	}
+	for (uint32_t mip = layout.first_tail_level; mip < cube.resources.levels; ++mip) {
+		const auto& part  = layout.mips[mip];
+		const auto& guest = cube.mip_layout[mip];
+		if (part.offset != tail_offset || guest.offset != part.offset ||
+		    guest.size != part.size * cube.resources.layers ||
+		    guest.pitch != part.padded_width || guest.height != part.padded_height ||
+		    part.tail_x + part.width > block.block_width ||
+		    part.tail_y + part.height > block.block_height) {
+			return -1;
+		}
+	}
+	return static_cast<int32_t>(layer);
+}
+
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
 	const auto& metadata = desc.info.metadata;
@@ -590,6 +651,25 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	}
 }
 
+void TextureCache::CopyImageMipTail(ImageId destination_id, ImageId source_id, uint32_t layer,
+                                    const TileSurfaceLayout& layout) {
+	RefreshCopySource(source_id);
+	auto& destination = m_slot_images[destination_id];
+	auto& source      = m_slot_images[source_id];
+	TrackImage(destination_id);
+	EXIT_IF(source.IsBufferModified() || source.backing.samples != 1 ||
+	        destination.backing.samples != 1);
+	for (uint32_t mip = layout.first_tail_level; mip < destination.info.resources.levels; ++mip) {
+		const auto& part = layout.mips[mip];
+		destination.CopyMipRegion(source, mip, layer,
+		                          {static_cast<int32_t>(part.tail_x),
+		                           static_cast<int32_t>(part.tail_y), 0});
+	}
+	if (source.IsGpuModified()) {
+		destination.MarkGpuModified();
+	}
+}
+
 ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
                                           ImageId cached_id) {
 	auto& cached = m_slot_images[cached_id];
@@ -846,6 +926,21 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		     cached.info.data.size, static_cast<uint32_t>(requested.type),
 		     static_cast<uint32_t>(cached.info.type), static_cast<uint32_t>(requested.tile_mode),
 		     static_cast<uint32_t>(cached.info.tile_mode));
+	}
+
+	TileSurfaceLayout tail_layout {};
+	const int32_t     tail_layer = MipTailBlockLayer(cached.info, requested, tail_layout);
+	if (tail_layer >= 0) {
+		if (!merged_id) {
+			merged_id                      = InsertImage(requested);
+			m_slot_images[merged_id].usage = cached.usage;
+			InitializeImage(merged_id);
+		}
+		cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
+		m_slot_images[merged_id].binding.is_target |= cached.binding.is_target;
+		CopyImageMipTail(merged_id, cached_id, static_cast<uint32_t>(tail_layer), tail_layout);
+		FreeImage(cached_id);
+		return {merged_id};
 	}
 
 	const int32_t requested_mip = requested.MipOf(cached.info);

@@ -6,6 +6,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfProbe.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -836,6 +837,7 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             DrawRenderState& state) {
+	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Programs);
 	m_context.GetImageHeap().BeginDraw();
 	m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
 	// Vertex programs beyond the host mesh limits or with unsupported call targets are not
@@ -1045,6 +1047,7 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
                                          DrawRenderState& state, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source) {
+	Common::PerfProbe::Scope draw_probe(Common::PerfProbe::Slot::DrawTotal);
 	auto&      ucfg                     = buffer.GetUserConfig();
 	const bool primitive_restart_enable = state.primitive_restart_enable;
 	if (CopyDepthToColor(buffer, draw, emit, state)) {
@@ -1100,20 +1103,25 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
-	for (uint32_t i = 0; i < vertex_stages.size(); i++) {
-		PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
-		descriptor_stages[stage_count++] = &bindings.vertex[i];
+	std::span<PreparedBindings* const> stages;
+	{
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Bindings);
+		for (uint32_t i = 0; i < vertex_stages.size(); i++) {
+			PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
+			descriptor_stages[stage_count++] = &bindings.vertex[i];
+		}
+		if (state.ps_active) {
+			PrepareBindings(state.ps_input_info.stage, bindings.pixel);
+			descriptor_stages[stage_count++] = &bindings.pixel;
+		}
+		stages = std::span {descriptor_stages.data(), stage_count};
+		PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
 	}
-	if (state.ps_active) {
-		PrepareBindings(state.ps_input_info.stage, bindings.pixel);
-		descriptor_stages[stage_count++] = &bindings.pixel;
-	}
-	const auto stages = std::span {descriptor_stages.data(), stage_count};
-	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	vk::DeviceAddress     mesh_indices = 0;
 	if (!mesh_active) {
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::VertexBuffers);
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	} else if (draw.indexed) {
@@ -1129,11 +1137,19 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
 		EXIT_IF((args_buffer.second & 3u) != 0);
 	}
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state);
+	PipelineCache::Pipeline* pipeline_ptr = nullptr;
+	{
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Pipeline);
+		pipeline_ptr = &m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state);
+	}
+	auto&                pipeline = *pipeline_ptr;
 	vk::ImageAspectFlags feedback_aspects;
-	const auto rendering =
-	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
-	                         feedback_aspects, stages);
+	RenderState          rendering;
+	{
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::RenderTargets);
+		rendering = AcquireRenderTargets(buffer, state.color_info, state.color_count,
+		                                 state.depth_info, feedback_aspects, stages);
+	}
 	vk::DeviceAddress task_params = 0;
 	if (mesh_task) {
 		const MeshTaskParams params {
@@ -1159,7 +1175,10 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
 	}
-	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	{
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::CommitBindings);
+		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	}
 	if (!mesh_active) {
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
@@ -1191,10 +1210,13 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	}
 
 	auto& dynamic_state = m_context.GetCommandScheduler().GetDynamicState();
-	UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), state.depth_info,
-	                           rendering);
-	dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
-	dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
+	{
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::DynamicState);
+		UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), state.depth_info,
+		                           rendering);
+		dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
+		dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
+	}
 
 	vk::PipelineStageFlags shader_write_stages = {};
 	for (const auto& stage: vertex_stages) {
@@ -1210,24 +1232,27 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		buffer.EndRendering();
 		ShaderWriteHazardBarrier(vk_buffer, shader_write_stages);
 	}
-	buffer.BeginRendering(rendering);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
-	auto&         occlusion_queries = m_context.GetOcclusionQueries();
-	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
-	if (mesh_task) {
-		vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
-	} else if (mesh_active) {
-		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
-	} else if (args_buffer.first == nullptr) {
-		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
-	} else if (draw.indexed) {
-		vk_buffer.drawIndexedIndirect(args_buffer.first->Handle(), args_buffer.second,
-		                              emit.indirect.count, emit.indirect.stride);
-	} else {
-		vk_buffer.drawIndirect(args_buffer.first->Handle(), args_buffer.second,
-		                       emit.indirect.count, emit.indirect.stride);
+	{
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::DrawCall);
+		buffer.BeginRendering(rendering);
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+		auto&         occlusion_queries = m_context.GetOcclusionQueries();
+		const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
+		if (mesh_task) {
+			vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
+		} else if (mesh_active) {
+			vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+		} else if (args_buffer.first == nullptr) {
+			EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+		} else if (draw.indexed) {
+			vk_buffer.drawIndexedIndirect(args_buffer.first->Handle(), args_buffer.second,
+			                              emit.indirect.count, emit.indirect.stride);
+		} else {
+			vk_buffer.drawIndirect(args_buffer.first->Handle(), args_buffer.second,
+			                       emit.indirect.count, emit.indirect.stride);
+		}
+		occlusion_queries.End(vk_buffer, occlusion_query);
 	}
-	occlusion_queries.End(vk_buffer, occlusion_query);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
 
@@ -1235,6 +1260,11 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		buffer.EndRendering();
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
 	}
+	{
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Flush);
+		m_context.GetCommandScheduler().FlushForOverlap();
+	}
+	Common::PerfProbe::Tick();
 }
 
 // Vulkan offsets for a prepared draw, or nullopt when its indirect records need the CPU:
@@ -1273,6 +1303,7 @@ static std::optional<DrawEmitInfo> ResolveDrawEmit(const HW::UserConfig&        
 
 bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::DrawIndexTotal);
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
@@ -1365,6 +1396,7 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::DrawIndexTotal);
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();

@@ -81,8 +81,8 @@ template <class S, class Key> void IoKey(S& io, Key& key) {
 
 template <class S, class Module> void IoModule(S& io, Module& stage) {
 	// The handle comes from the SPIR-V; stored programs have no function code.
-	auto& [id, handle, info, specialization, function_code, vertex_formats, rect_parameters,
-	       mesh_task] = stage;
+	auto& [id, handle, info, specialization, function_code, vertex_formats, descriptor_buffers,
+	       rect_parameters, mesh_task] = stage;
 	IoAll(io, id, info, specialization, vertex_formats, rect_parameters, mesh_task);
 }
 
@@ -237,6 +237,7 @@ bool PipelineCache::LoadRecord(std::span<const uint8_t>& records) {
 			if (!complete()) {
 				return false;
 			}
+			UpdateShaderModuleDescriptorBuffers(module);
 			const auto [program, inserted] = m_program_cache.try_emplace(std::move(key));
 			if (inserted &&
 			    !ShaderRecompiler::IR::LoadResourcePlan(plan, program->second.resource_plan)) {
