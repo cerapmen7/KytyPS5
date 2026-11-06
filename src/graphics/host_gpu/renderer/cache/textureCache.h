@@ -152,6 +152,8 @@ private:
 	void               CopyImage(ImageId destination, ImageId source);
 	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
+	void CopyImageMipTail(ImageId destination, ImageId source, uint32_t layer,
+	                      const TileSurfaceLayout& layout);
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);

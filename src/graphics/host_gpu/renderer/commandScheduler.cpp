@@ -2,9 +2,11 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/perfProbe.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <optional>
 
 namespace Libs::Graphics {
@@ -144,6 +146,25 @@ void CommandScheduler::Flush() {
 void CommandScheduler::Flush(SubmitInfo& submit) {
 	Submit(submit);
 	BeginNext();
+}
+
+void CommandScheduler::FlushForOverlap() {
+	static const uint32_t interval = [] {
+		const auto* const value = std::getenv("KYTY_OVERLAP_DRAWS");
+		if (value == nullptr || *value == '\0') {
+			return 32u;
+		}
+		return static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+	}();
+	if (interval == 0 || m_command.IsInvalid()) {
+		return;
+	}
+	if (++m_overlap_draws < interval) {
+		return;
+	}
+	m_overlap_draws = 0;
+	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Flush);
+	Flush();
 }
 
 void CommandScheduler::Finish() {

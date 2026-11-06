@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfProbe.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -18,6 +19,8 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <bit>
 #include <cstdio>
 #include <cstring>
@@ -40,6 +43,10 @@ namespace Libs::Graphics {
 struct ShaderMapData: ShaderMappedData {
 	ShaderVertexMetadata vertex;
 	const char*          vertex_error = nullptr;
+	// Host copy of the input semantics. The guest copy lives in the shader binary, which can be
+	// backed by GPU-visible memory; reading it per draw is far more expensive than copying it
+	// once at map time.
+	std::array<ShaderSemantic, ShaderVertexInputInfo::RES_MAX> semantics {};
 };
 
 struct ShaderMapEntry {
@@ -49,6 +56,26 @@ struct ShaderMapEntry {
 
 static std::unique_ptr<std::unordered_map<uint64_t, ShaderMapEntry>> g_shader_map;
 static std::mutex                                                      g_shader_map_mutex;
+
+// Read-mostly lookup cache: shader mappings are registered while loading and then queried
+// several times per draw. Each thread keeps its own direct-mapped cache, invalidated by a
+// global version bump on registration.
+static std::atomic<uint64_t> g_shader_map_version {1};
+
+namespace {
+struct ShaderLookupCacheEntry {
+	uint64_t       addr    = 0;
+	uint64_t       version = 0;
+	ShaderMapEntry entry {};
+	bool           valid = false;
+};
+constexpr size_t kShaderLookupCacheSize = 32;
+} // namespace
+
+static ShaderLookupCacheEntry& ShaderLookupSlot(uint64_t addr) {
+	static thread_local std::array<ShaderLookupCacheEntry, kShaderLookupCacheSize> cache {};
+	return cache[(addr >> 4u) & (kShaderLookupCacheSize - 1u)];
+}
 
 void ShaderInit() {
 	EXIT_IF(g_shader_map != nullptr);
@@ -85,16 +112,43 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	const auto hash        = XXH3_64bits(binary, mapped.code_size_bytes);
 	mapped.vertex_error =
 	    ShaderReadVertexMetadata(data, HW::UserSgprInfo::SGPRS_MAX, mapped.vertex);
+	const auto semantics_count = mapped.vertex.input_semantics.size();
+	const bool copy_semantics =
+	    mapped.vertex.input_semantics.data() != nullptr &&
+	    semantics_count <= mapped.semantics.size();
+	if (copy_semantics) {
+		std::copy(mapped.vertex.input_semantics.begin(), mapped.vertex.input_semantics.end(),
+		          mapped.semantics.begin());
+		mapped.vertex.input_semantics = {mapped.semantics.data(), semantics_count};
+	}
 	std::scoped_lock lock(g_shader_map_mutex);
+	g_shader_map_version.fetch_add(1, std::memory_order_release);
 	(*g_shader_map)[addr] = {mapped, hash};
+	if (copy_semantics) {
+		auto& stored = (*g_shader_map)[addr];
+		stored.data.vertex.input_semantics = {stored.data.semantics.data(), semantics_count};
+	}
+	g_shader_map_version.fetch_add(1, std::memory_order_release);
 }
 
 static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
 	EXIT_IF(g_shader_map == nullptr);
+	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::MapLookup);
+
+	auto& slot = ShaderLookupSlot(addr);
+	if (slot.valid && slot.addr == addr &&
+	    slot.version == g_shader_map_version.load(std::memory_order_acquire)) {
+		return slot.entry;
+	}
 
 	std::scoped_lock lock(g_shader_map_mutex);
 
 	if (auto iter = g_shader_map->find(addr); iter != g_shader_map->end()) {
+		const auto version = g_shader_map_version.load(std::memory_order_acquire);
+		slot.addr          = addr;
+		slot.version       = version;
+		slot.entry         = iter->second;
+		slot.valid         = true;
 		return iter->second;
 	}
 
@@ -119,28 +173,26 @@ static ShaderParams GetShaderParams(uint64_t shader_addr, uint64_t hash,
 
 static void ShaderDetectBuffers(ShaderVertexInputInfo& info) {
 	KYTY_PROFILER_FUNCTION();
+	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::StaticDetect);
 
 	info.buffers_num = 0;
 
 	for (int ri = 0; ri < info.resources_num; ri++) {
-		const auto& r = info.resources[ri];
-
-		auto& destination = info.resources_dst[ri];
-		int bi = 0;
+		const auto& r           = info.resources[ri];
+		auto&       destination = info.resources_dst[ri];
+		// Decode the sharp fields once instead of on every candidate comparison.
+		const uint32_t r_stride   = static_cast<uint32_t>(r.Stride());
+		const uint64_t r_base     = r.Base48();
+		const uint32_t r_records  = r.NumRecords();
+		int            bi         = 0;
 		for (; bi < info.buffers_num; bi++) {
 			auto& b = info.buffers[bi];
-
-			uint64_t stride = b.stride;
-
-			if (stride == r.Stride() &&
-			    b.fetch_index == destination.fetch_index) {
-				uint64_t rbase   = r.Base48();
-				uint64_t base    = std::min(rbase, b.addr);
-				uint64_t offset1 = rbase - base;
-				uint64_t offset2 = b.addr - base;
-
-				if (offset1 < stride && offset2 < stride) {
-					EXIT_NOT_IMPLEMENTED(b.num_records != r.NumRecords());
+			if (b.stride == r_stride && b.fetch_index == destination.fetch_index) {
+				const uint64_t base    = std::min(r_base, b.addr);
+				const uint64_t offset1 = r_base - base;
+				const uint64_t offset2 = b.addr - base;
+				if (offset1 < r_stride && offset2 < r_stride) {
+					EXIT_NOT_IMPLEMENTED(b.num_records != r_records);
 					b.addr = base;
 					break;
 				}
@@ -149,9 +201,9 @@ static void ShaderDetectBuffers(ShaderVertexInputInfo& info) {
 
 		if (bi == info.buffers_num) {
 			EXIT_NOT_IMPLEMENTED(info.buffers_num >= ShaderVertexInputInfo::RES_MAX);
-			info.buffers[bi] = {.addr = r.Base48(),
-			                    .stride = r.Stride(),
-			                    .num_records = r.NumRecords(),
+			info.buffers[bi] = {.addr        = r_base,
+			                    .stride      = r_stride,
+			                    .num_records = r_records,
 			                    .fetch_index = destination.fetch_index};
 			info.buffers_num++;
 		}
@@ -163,12 +215,81 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
                                        std::span<const ShaderSemantic> input_semantics,
                                        const uint32_t* attrib, const uint32_t* buffer) {
 	KYTY_PROFILER_FUNCTION();
+	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::StaticApply);
 
 	EXIT_IF(attrib == nullptr || buffer == nullptr);
 
 	const bool debug_dump = Config::GraphicsDebugDumpEnabled();
 
-	for (uint32_t i = 0; i < input_semantics.size(); i++) {
+	const auto count = input_semantics.size();
+	// The guest tables live in a ring buffer and are usually cold in the CPU cache. Copy
+	// both complete tables once, sequentially, then decode from warm stack memory. The
+	// per-semantic dependent loads were the expensive part of this function.
+	std::array<uint32_t, ShaderVertexInputInfo::RES_MAX>     attrib_table {};
+	std::array<uint32_t, ShaderVertexInputInfo::RES_MAX * 4> buffer_table {};
+	std::memcpy(attrib_table.data(), attrib, sizeof(attrib_table));
+	std::memcpy(buffer_table.data(), buffer, sizeof(buffer_table));
+
+	if (count <= ShaderVertexInputInfo::RES_MAX) {
+		std::array<uint32_t, ShaderVertexInputInfo::RES_MAX> attrib_values {};
+		for (uint32_t i = 0; i < count; i++) {
+			const auto& in = input_semantics[i];
+			EXIT_NOT_IMPLEMENTED(in.static_vb_index == 1 || in.static_attribute == 1);
+			attrib_values[i] = attrib_table[in.semantic];
+			if (debug_dump) {
+				LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", in.hardware_mapping,
+				     in.size_in_elements, i, attrib_values[i]);
+			}
+		}
+		for (uint32_t i = 0; i < count; i++) {
+			const auto index = attrib_values[i] & 0x1fu;
+			EXIT_NOT_IMPLEMENTED(index >= ShaderVertexInputInfo::RES_MAX);
+		}
+		for (uint32_t i = 0; i < count; i++) {
+			const auto& in           = input_semantics[i];
+			const auto  attrib_value = attrib_values[i];
+			const auto  index        = attrib_value & 0x1fu;
+			auto        format =
+			    static_cast<Prospero::VertexAttribFormat>((attrib_value >> 5u) & 0x1ffu);
+			const uint32_t offset      = (attrib_value >> 14u) & 0xfffu;
+			const uint32_t fetch_index = (attrib_value >> 26u) & 0x1u;
+			const auto*    sharp       = &buffer_table[index * 4];
+
+			EXIT_NOT_IMPLEMENTED(info.resources_num >= ShaderVertexInputInfo::RES_MAX);
+
+			auto& r           = info.resources[info.resources_num];
+			auto& rd          = info.resources_dst[info.resources_num];
+			rd.register_start = static_cast<int>(in.hardware_mapping);
+			rd.registers_num  = static_cast<int>(in.size_in_elements);
+			rd.attr_id        = static_cast<int>(in.semantic);
+			rd.fetch_index    = fetch_index;
+			r.fields[0]       = sharp[0];
+			r.fields[1]       = sharp[1];
+			r.fields[2]       = sharp[2];
+			r.fields[3]       = sharp[3];
+			EXIT_NOT_IMPLEMENTED(r.AddTid());
+			EXIT_NOT_IMPLEMENTED(r.SwizzleEnabled());
+			if (format != Prospero::VertexAttribFormat::kInvalid) {
+				const auto format_raw    = static_cast<uint32_t>(format);
+				const auto buffer_format = format_raw >> 2u;
+				const auto channels      = (format_raw & 3u) + 1u;
+				// AGC vertex formats encode the buffer format above the two channel-count bits.
+				// The fetch prolog selects X001, XY01, XYZ1, or XYZW from that count.
+				r.fields[3] = (r.fields[3] & ~((0x7fu << 12u) | 0xfffu)) |
+				              (buffer_format << 12u) |
+				              DstSel(4, channels > 1u ? 5u : 0u, channels > 2u ? 6u : 0u,
+				                     channels > 3u ? 7u : 1u);
+			}
+			if (offset != 0) {
+				r.UpdateAddress48(r.Base48() + offset);
+			}
+
+			info.resources_num++;
+		}
+		return;
+	}
+
+	for (uint32_t i = 0; i < count; i++) {
 		const auto& in = input_semantics[i];
 
 		EXIT_NOT_IMPLEMENTED(in.static_vb_index == 1 || in.static_attribute == 1);
@@ -178,18 +299,19 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 
 		if (debug_dump) {
 			LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i,
-			     attrib[in.semantic]);
+			     attrib_table[in.semantic]);
 		}
 
-		size_t index = attrib[in.semantic] & 0x1fu;
+		const auto  attrib_value = attrib_table[in.semantic];
+		size_t index = attrib_value & 0x1fu;
 		auto   format =
-		    static_cast<Prospero::VertexAttribFormat>((attrib[in.semantic] >> 5u) & 0x1ffu);
-		uint32_t offset      = (attrib[in.semantic] >> 14u) & 0xfffu;
-		uint32_t fetch_index = (attrib[in.semantic] >> 26u) & 0x1u;
+		    static_cast<Prospero::VertexAttribFormat>((attrib_value >> 5u) & 0x1ffu);
+		uint32_t offset      = (attrib_value >> 14u) & 0xfffu;
+		uint32_t fetch_index = (attrib_value >> 26u) & 0x1u;
 
 		EXIT_NOT_IMPLEMENTED(index >= ShaderVertexInputInfo::RES_MAX);
 
-		const auto* sharp = &buffer[index * 4];
+		const auto* sharp = &buffer_table[index * 4];
 
 		EXIT_NOT_IMPLEMENTED(info.resources_num >= ShaderVertexInputInfo::RES_MAX);
 
@@ -285,8 +407,12 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
                                            const ShaderMapData&   data,
                                            ShaderVertexInputInfo& info) {
 	KYTY_PROFILER_FUNCTION();
+	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::StaticInfo);
 
-	info = {};
+	{
+		Common::PerfProbe::Scope zero_probe(Common::PerfProbe::Slot::StaticZero);
+		info = {};
+	}
 
 	info.pa_cl_vs_out_cntl = sh.m_paClVsOutCntl;
 
@@ -322,6 +448,9 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 			     shader_addr);
 			return false;
 		}
+
+		// The attribute and buffer tables are cold in the CPU cache on the first draw that uses
+		// them, so decode them with memory-level parallelism inside ShaderApplyAttribSemantics.
 		ShaderApplyAttribSemantics(info, metadata.input_semantics, attrib, buffer);
 		ShaderDetectBuffers(info);
 	}
@@ -334,6 +463,56 @@ static void ShaderGetStaticInputInfoPS(
 	const ShaderMappedData& data, ShaderPixelInputInfo& ps_info) {
 	KYTY_PROFILER_FUNCTION();
 
+	// The pixel static input info depends only on immutable shader metadata and on a small
+	// set of PS registers. Materials repeat these values across consecutive draws, so hash
+	// every input and reuse the previous result instead of rebuilding it.
+	uint64_t key = 0xcbf29ce484222325ull;
+	auto     add = [&key](uint64_t value) {
+        key ^= value;
+        key *= 0x100000001b3ull;
+	};
+	add(regs.ps_regs.data_addr);
+	add(static_cast<uint64_t>(regs.ps_regs.rsrc2.extra_lds_size) << 32u |
+	    data.code_size_bytes);
+	add(reinterpret_cast<uintptr_t>(data.input_semantics));
+	add(static_cast<uint64_t>(data.num_input_semantics) << 32u |
+	    data.scratch_size_dwords);
+	add(sh.ps_in_control);
+	add(sh.ps_input_ena);
+	add(sh.ps_input_addr);
+	add(sh.baryc_cntl);
+	add(sh.m_cbShaderMask);
+	add(static_cast<uint64_t>(sh.db_shader_control.shader_kill_enable) |
+	    (static_cast<uint64_t>(sh.db_shader_control.shader_z_export_enable) << 1u) |
+	    (static_cast<uint64_t>(sh.db_shader_control.shader_mask_export_enable) << 2u) |
+	    (static_cast<uint64_t>(sh.db_shader_control.shader_execute_on_noop) << 3u) |
+	    (static_cast<uint64_t>(sh.db_shader_control.shader_z_behavior) << 4u) |
+	    (static_cast<uint64_t>(sh.AlphaToMask()) << 8u));
+	for (const auto mode: sh.target_output_mode) {
+		add(mode);
+	}
+	for (const auto setting: sh.ps_interpolator_settings) {
+		add(setting);
+	}
+	for (const auto& mapping: target_export_mapping) {
+		add(mapping.packed);
+	}
+
+	struct CacheEntry {
+		uint64_t             key   = 0;
+		bool                 valid = false;
+		ShaderPixelInputInfo info {};
+	};
+	constexpr size_t kCacheSize = 8192;
+	static thread_local std::array<CacheEntry, kCacheSize> cache {};
+	auto& entry = cache[key & (kCacheSize - 1u)];
+	if (entry.valid && entry.key == key) {
+		Common::PerfProbe::Scope hit(Common::PerfProbe::Slot::PsStaticHit);
+		ps_info = entry.info;
+		return;
+	}
+
+	Common::PerfProbe::Scope miss(Common::PerfProbe::Slot::PsStaticMiss);
 	ps_info = {};
 	ps_info.scratch_size_dwords = data.scratch_size_dwords;
 	ps_info.lds_size_dwords     = static_cast<uint32_t>(regs.ps_regs.rsrc2.extra_lds_size) * 128u;
@@ -392,6 +571,10 @@ static void ShaderGetStaticInputInfoPS(
 		                                       ? target_export_mapping[slot]
 		                                       : Prospero::ColorComponentMapping {};
 	}
+
+	entry.key   = key;
+	entry.info  = ps_info;
+	entry.valid = true;
 }
 
 static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
@@ -676,7 +859,11 @@ ShaderParams PrepareProgram(
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
     ShaderPixelInputInfo&                               ps_info) {
 	const auto [data, hash] = ShaderGetMappedData(regs.ps_regs.data_addr, "ShaderGetInputInfoPS():");
-	ShaderGetStaticInputInfoPS(regs, sh, target_export_mapping, data, ps_info);
+	{
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::PsStatic);
+		ShaderGetStaticInputInfoPS(regs, sh, target_export_mapping, data, ps_info);
+	}
+	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::PsParams);
 	return GetShaderParams(
 	    regs.ps_regs.data_addr, hash,
 	    std::span<const uint32_t>(regs.ps_user_sgpr.value, regs.ps_regs.rsrc2.user_sgpr), data);

@@ -391,7 +391,9 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float 
 		    buffer_us != 0
 		        ? static_cast<uint32_t>((AUDIO_OUT_TARGET_LATENCY_US + buffer_us - 1) / buffer_us)
 		        : 2u;
-		min_queued_size           = prepared_size * std::clamp(buffers, 2u, 16u);
+		// Keep the full 40 ms reserve for small guest grains: 64 frames at 48 kHz need
+		// 30 buffers, while a 16-buffer cap would silently halve their underrun protection.
+		min_queued_size           = prepared_size * std::max(buffers, 2u);
 		const auto wait_start      = LibKernel::KernelGetProcessTime();
 		auto       queued          = SDL_GetAudioStreamQueued(port->stream);
 		while (queued > static_cast<int>(min_queued_size)) {

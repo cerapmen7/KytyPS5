@@ -6,6 +6,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfProbe.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -119,9 +120,12 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	if (size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
 		EXIT("storage buffer range is unsupported\n");
 	}
-	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(
-	    address, size, resource.written,
-	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id);
+	auto [buffer, offset] = [&] {
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::NatObtain);
+		return context.GetBufferCache().ObtainBuffer(
+		    address, size, resource.written,
+		    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id);
+	}();
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
@@ -686,6 +690,7 @@ void RenderExecutor::BindRenderTarget(ImageId id) {
 }
 
 void RenderExecutor::ResetBindings() {
+	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::ResetBindings);
 	for (const auto id: m_bound_images) {
 		m_context.GetTextureCache().m_slot_images[id].binding = {};
 	}
@@ -695,6 +700,7 @@ void RenderExecutor::ResetBindings() {
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
+	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::PrepareStages);
 	EXIT_IF(!runtime);
 	const auto& program  = runtime.module->info;
 	const auto& snapshot = *runtime.resources;
@@ -734,6 +740,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 
 void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	KYTY_PROFILER_FUNCTION();
+	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::FindBuffers);
 	auto& cache = m_context.GetBufferCache();
 	for (auto* stage: stages) {
 		auto&       prepared = *stage;
@@ -744,9 +751,8 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 		if (layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)] == 0) {
 			continue;
 		}
-		for (uint32_t resource = 0; resource < program.info.buffers.size(); ++resource) {
+		for (const uint32_t resource: prepared.runtime->module->descriptor_buffers) {
 			const auto& metadata = program.info.buffers[resource];
-			if (metadata.descriptor_index == UINT32_MAX) continue;
 			auto& source = prepared.buffer_sources[metadata.descriptor_index];
 			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
 			const auto address = descriptor.Base48();
@@ -793,6 +799,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
+	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::RebindBuffers);
 	const auto& program  = prepared.runtime->module->info;
 	const auto& snapshot = *prepared.runtime->resources;
 	const auto& layout   = program.bindings;
@@ -805,16 +812,19 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const auto shift = (index % 4u) * 8u;
 		prepared.shader_data[dword] |= offset << shift;
 	};
-	for (const auto& resource: program.info.buffers) {
-		const auto index = resource.descriptor_index;
-		if (index == UINT32_MAX) continue;
-		uint32_t buffer_offset = 0;
-		prepared.buffers[index] = NativeStorageBuffer(m_context, prepared.buffer_sources[index],
-		                                              resource, buffer_offset);
-		pack_memory_offset(index, buffer_offset);
-		// Null bindings allow 0 bytes, not the shared null buffer's 16, so no store reaches it.
-		prepared.shader_data[layout.MemorySizeDword() + index] =
-		    static_cast<uint32_t>(prepared.buffer_sources[index].size + buffer_offset);
+	{
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::NatBuf);
+		for (const uint32_t resource_index: prepared.runtime->module->descriptor_buffers) {
+			const auto& resource = program.info.buffers[resource_index];
+			const auto  index    = resource.descriptor_index;
+			uint32_t    buffer_offset = 0;
+			prepared.buffers[index] = NativeStorageBuffer(
+			    m_context, prepared.buffer_sources[index], resource, buffer_offset);
+			pack_memory_offset(index, buffer_offset);
+			// Null bindings allow 0 bytes, not the shared null buffer's 16, so no store reaches it.
+			prepared.shader_data[layout.MemorySizeDword() + index] =
+			    static_cast<uint32_t>(prepared.buffer_sources[index].size + buffer_offset);
+		}
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
@@ -826,6 +836,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
+	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::RebindImages);
 	const auto& program       = prepared.runtime->module->info;
 	const auto& snapshot      = *prepared.runtime->resources;
 	auto&       images        = prepared.images;

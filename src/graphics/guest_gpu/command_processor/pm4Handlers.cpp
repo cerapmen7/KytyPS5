@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/perfProbe.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
@@ -852,7 +853,10 @@ KYTY_CP_OP_PARSER(CpOpEventWrite) {
 		event_address = buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u);
 	}
 
-	cp.TriggerEvent(event_type, event_index, event_address);
+	{
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Evt);
+		cp.TriggerEvent(event_type, event_index, event_address);
+	}
 
 	return packet_size_dw - 1u;
 }
@@ -1184,10 +1188,13 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 
 	// The event type, cache actions and destination cache only order GPU work, which the renderer's
 	// resource barriers already order.
+	{
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::RelMem);
 	cp.ReleaseMem(
 	    (buffer[1] >> 29u) & 0x7u, (buffer[1] >> 24u) & 0x7u,
 	    reinterpret_cast<void*>((buffer[2] & ~0x3u) | (static_cast<uint64_t>(buffer[3]) << 32u)),
 	    buffer[4] | (static_cast<uint64_t>(buffer[5]) << 32u), buffer[6] & 0x07ffffffu);
+	}
 
 	return 7;
 }
@@ -1358,8 +1365,10 @@ KYTY_CP_OP_PARSER(CpOpWriteData) {
 	auto  write_control = buffer[0];
 	auto* dst = reinterpret_cast<uint32_t*>(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u));
 
-	cp.WriteData(dst, buffer + 3, dw_num - 2, write_control);
-
+	{
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::WrData);
+		cp.WriteData(dst, buffer + 3, dw_num - 2, write_control);
+	}
 	return 1 + dw_num;
 }
 

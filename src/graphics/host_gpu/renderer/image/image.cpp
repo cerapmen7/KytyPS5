@@ -601,6 +601,44 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
 
+void Image::CopyMipRegion(Image& source, uint32_t mip, uint32_t layer,
+                          vk::Offset3D source_offset) {
+	EXIT_IF(source.backing.samples != backing.samples || mip >= backing.mip_levels ||
+	        layer >= backing.layers);
+	m_scheduler.EndRendering();
+	const auto width  = std::max(backing.extent.width >> mip, 1u);
+	const auto height = std::max(backing.extent.height >> mip, 1u);
+	const auto depth  = std::max(backing.extent.depth >> mip, 1u);
+	EXIT_IF(source_offset.x < 0 || source_offset.y < 0 || source_offset.z < 0 ||
+	        static_cast<uint64_t>(source_offset.x) + width > source.backing.extent.width ||
+	        static_cast<uint64_t>(source_offset.y) + height > source.backing.extent.height ||
+	        static_cast<uint64_t>(source_offset.z) + depth > source.backing.extent.depth);
+	const auto [source_layers, destination_layers] = SanitizeCopyLayers(source, *this, depth);
+	const auto aspects                             = FullAspectMask(source.backing.format);
+	EXIT_IF(aspects != FullAspectMask(backing.format));
+	std::array<vk::ImageCopy, 2> copies {};
+	uint32_t                     copy_count = 0;
+	for (const auto aspect: {vk::ImageAspectFlagBits::eColor, vk::ImageAspectFlagBits::eDepth,
+	                         vk::ImageAspectFlagBits::eStencil}) {
+		if (!static_cast<bool>(aspects & aspect)) {
+			continue;
+		}
+		auto& copy          = copies[copy_count++];
+		copy.srcSubresource = {aspect, 0, 0, source_layers};
+		copy.srcOffset      = source_offset;
+		copy.dstSubresource = {aspect, mip, layer, destination_layers};
+		copy.extent         = {width, height, depth};
+	}
+	auto command = m_scheduler.Current().Handle();
+	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
+	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
+	               command);
+	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
+	                  vk::ImageLayout::eTransferDstOptimal, copy_count, copies.data());
+	Transit(vk::ImageLayout::eGeneral,
+	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
+}
+
 namespace ImageOps {
 
 void Validate(const ImageInfo& info) {

@@ -5,6 +5,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfProbe.h"
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -234,6 +235,16 @@ std::vector<vk::Format> VertexInputFormats(const ShaderVertexInputInfo&         
 
 } // namespace
 
+void UpdateShaderModuleDescriptorBuffers(ShaderModule& module) {
+	module.descriptor_buffers.clear();
+	const auto& buffers = module.info.info.buffers;
+	for (uint32_t index = 0; index < buffers.size(); index++) {
+		if (buffers[index].descriptor_index != UINT32_MAX) {
+			module.descriptor_buffers.push_back(index);
+		}
+	}
+}
+
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	// AMD GPUs (vendor 0x1002) run NMin/NMax as v_min/v_max, which give the guest's NaN and
 	// signed-zero results; GLSL.std.450 alone does not order -0 below +0.
@@ -281,6 +292,7 @@ bool PipelineCache::Program::RefreshCallSource(const ShaderRecompiler::IR::SrtRu
 template <bool HasCalls>
 ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
                                                  uint32_t push_data_cursor) {
+	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::MatRes);
 	EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
 	                                                    specialization));
 	for (auto& candidate: modules) {
@@ -329,6 +341,7 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	    .specialization = program.specialization,
 	    .function_code  = {function_code.begin(), function_code.end()},
 	});
+	UpdateShaderModuleDescriptorBuffers(module);
 	m_compiled[static_cast<size_t>(key.stage)]++;
 	// Guest geometry shaders are compiled through the host mesh stage.
 	std::printf("Shaders: VS %u | PS %u | CS %u | GS %u | LS %u | HS %u | TES %u\n",
@@ -389,8 +402,14 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	m_lookup_key.stage           = options.stage;
 	m_lookup_key.hash            = params.hash;
 	m_lookup_key.user_data_count = params.user_data_count;
-	BuildStageStaticKey(input_info, m_lookup_key.static_state);
-	auto entry = m_program_cache.find(m_lookup_key);
+	{
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::GpKey);
+		BuildStageStaticKey(input_info, m_lookup_key.static_state);
+	}
+	auto entry = [&] {
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::GpFind);
+		return m_program_cache.find(m_lookup_key);
+	}();
 	const auto bind = [&](const ShaderModule& module) {
 		input_info.stage = {.module = &module, .resources = &entry->second.resources};
 		module.info.bindings.AdvancePushData(push_data_cursor);
@@ -403,9 +422,9 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		ShaderModule* module = nullptr;
 		if (cached.call_source) {
 			source_changed = cached.RefreshCallSource(runtime);
-			if (!source_changed) module = cached.FindModule<true>(runtime, push_data_cursor);
+			if (!source_changed) module = cached.template FindModule<true>(runtime, push_data_cursor);
 		} else {
-			module = cached.FindModule<false>(runtime, push_data_cursor);
+			module = cached.template FindModule<false>(runtime, push_data_cursor);
 		}
 		if (module != nullptr) return bind(*module);
 	}
@@ -454,7 +473,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		    program.resource_plan, runtime, program.resources, program.specialization));
 	} else if (source_changed) {
 		entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-		if (const auto* module = entry->second.FindModule<true>(runtime, push_data_cursor)) {
+		if (const auto* module = entry->second.template FindModule<true>(runtime, push_data_cursor)) {
 			return bind(*module);
 		}
 	}
@@ -864,12 +883,43 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 
 const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                      ShaderComputeInputInfo&      input_info) {
+	// Compute dispatches repeat the same shader with different workgroup counts. Reuse the
+	// previous resolution when every input that selects the module is unchanged.
+	struct ComputeInputKey {
+		bool     async_compute;
+		bool     dispatch_thread_dimensions;
+		uint32_t host_subgroup_size;
+		uint32_t workgroup_counts[3];
+		uint64_t indirect_args_address;
+	} key {input_info.async_compute, input_info.dispatch_thread_dimensions,
+	       input_info.host_subgroup_size,
+	       {input_info.workgroup_counts[0], input_info.workgroup_counts[1],
+	        input_info.workgroup_counts[2]},
+	       input_info.indirect_args_address};
+	struct ComputeCacheEntry {
+		uint64_t               hash   = 0;
+		const ShaderModule*    module = nullptr;
+		ShaderComputeInputInfo info {};
+		bool                   valid = false;
+	};
+	static thread_local ComputeCacheEntry last {};
+	uint64_t hash = XXH3_64bits(&regs, sizeof(regs));
+	hash          = XXH3_64bits_withSeed(&key, sizeof(key), hash);
+	if (last.valid && last.hash == hash) {
+		input_info = last.info;
+		return last.module;
+	}
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, input_info);
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
 	uint32_t          push_data_cursor = 0;
-	return GetProgram(params, input_info, push_data_cursor);
+	const auto* module = GetProgram(params, input_info, push_data_cursor);
+	last.hash   = hash;
+	last.module = module;
+	last.info   = input_info;
+	last.valid  = true;
+	return module;
 }
 
 PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
