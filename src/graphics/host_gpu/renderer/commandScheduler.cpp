@@ -144,7 +144,10 @@ void CommandScheduler::Flush() {
 }
 
 void CommandScheduler::Flush(SubmitInfo& submit) {
-	Submit(submit);
+	{
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Submit);
+		Submit(submit);
+	}
 	BeginNext();
 }
 
@@ -172,7 +175,10 @@ void CommandScheduler::Finish() {
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
-	m_master.Wait(CurrentTick() - 1);
+	{
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::GpuWait);
+		m_master.Wait(CurrentTick() - 1);
+	}
 	BeginNext();
 	PopPendingOperations();
 }
@@ -184,11 +190,18 @@ void CommandScheduler::Wait(uint64_t tick) {
 		// A stream-buffer wrap can wait while a draw is being prepared through a reference to
 		// Current(). The wrapper stays stable while its pooled Vulkan buffer is retired. Deferred
 		// resources are released only at the next GPU operation boundary.
-		const auto submitted_tick = Submit();
+		const auto submitted_tick = [&] {
+			Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Submit);
+			return Submit();
+		}();
 		EXIT_IF(submitted_tick != tick);
-		m_master.Wait(tick);
+		{
+			Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::GpuWait);
+			m_master.Wait(tick);
+		}
 		BeginNext();
 	} else {
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::GpuWait);
 		m_master.Wait(tick);
 	}
 }
