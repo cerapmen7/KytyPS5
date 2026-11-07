@@ -6,6 +6,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfProbe.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -809,12 +810,21 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 			next_vblank = frame_begin + vblank_tick;
 			VblankBegin();
 		}
-		bool presented = m_flip_queue.Flip();
-		if (!presented && m_presenter.NeedsSystemOverlayRefresh()) {
-			if (!m_presenter.PresentLastFrame()) {
-				m_presenter.Present(m_presenter.PrepareBlankFrame(width, height, true));
+		bool guest_frame = false;
+		bool presented   = false;
+		{
+			Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Present);
+			guest_frame = m_flip_queue.Flip();
+			presented   = guest_frame;
+			if (!presented && m_presenter.NeedsSystemOverlayRefresh()) {
+				if (!m_presenter.PresentLastFrame()) {
+					m_presenter.Present(m_presenter.PrepareBlankFrame(width, height, true));
+				}
+				presented = true;
 			}
-			presented = true;
+		}
+		if (guest_frame) {
+			Common::PerfProbe::EndFrame();
 		}
 		if (!presented && vblank_due && total_wait.count() < 0) {
 			bool any_open = false;
