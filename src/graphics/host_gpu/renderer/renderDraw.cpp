@@ -856,6 +856,29 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             DrawRenderState& state) {
 	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Programs);
+	// Opt-in performance experiment: KYTY_SKIP_DEPTH_ONLY=1 drops the shadow/depth-only
+	// passes. CB_TARGET_MASK == 0 means the pixel shader writes no colour channel, so the
+	// pass only exists to fill a depth target. Tested before any program work so the skipped
+	// draws cost nothing. Read once; off unless the lab asks for it.
+	static const bool skip_depth_only = [] {
+		const auto* const value = std::getenv("KYTY_SKIP_DEPTH_ONLY");
+		return value != nullptr && *value != '\0' && std::strtoul(value, nullptr, 10) != 0;
+	}();
+	if (skip_depth_only) {
+		const auto& hw          = buffer.GetRegisters();
+		const auto& z           = hw.GetDepthRenderTarget();
+		bool        color_bound = false;
+		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+			if (hw.GetRenderTarget(slot).base.addr != 0) {
+				color_bound = true;
+				break;
+			}
+		}
+		if (!color_bound && (z.z_write_base_addr != 0 || z.stencil_write_base_addr != 0)) {
+			Common::PerfProbe::Add(Common::PerfProbe::Slot::DepthOnlyDraw, 0);
+			return false;
+		}
+	}
 	m_context.GetImageHeap().BeginDraw();
 	m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
 	// Vertex programs beyond the host mesh limits or with unsupported call targets are not
@@ -909,6 +932,21 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
 		                   draw.index_count, 0);
 		return false;
+	}
+
+	// Draw mix: depth-only passes (shadow cascades and depth prepasses) are the only GPU work
+	// a quality/performance trade could remove, so count them with the other draw shapes.
+	if (state.color_count == 0 && state.depth_info.image_id) {
+		Common::PerfProbe::Add(Common::PerfProbe::Slot::DepthOnlyDraw, 0);
+		if (skip_depth_only) {
+			return false;
+		}
+	}
+	if (state.color_count > 1) {
+		Common::PerfProbe::Add(Common::PerfProbe::Slot::MrtDraw, 0);
+	}
+	if (state.depth_info.image_id && state.depth_info.desc.info.extent.depth > 1) {
+		Common::PerfProbe::Add(Common::PerfProbe::Slot::LayeredDraw, 0);
 	}
 
 	return true;
