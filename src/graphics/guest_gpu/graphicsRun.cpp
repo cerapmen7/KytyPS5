@@ -213,6 +213,15 @@ void CommandProcessor::BufferFlush() {
 	m_renderer.GetOcclusionQueries().Publish();
 }
 
+void CommandProcessor::FlushForCadence() {
+	if (!GetScheduler().TakeCadenceSubmit()) {
+		return;
+	}
+	// Not BufferFlush, which also publishes the occlusion queries and so waits on the GPU.
+	GetScheduler().Flush();
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::CadenceSubmits);
+}
+
 void CommandProcessor::BufferWait() {
 	BufferInit();
 	GetScheduler().Finish();
@@ -618,6 +627,10 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			}
 			execution.m_next_buffer = {};
 		}
+		// Only here, after a whole packet, and never inside a handler. Handlers hold a
+		// CommandBuffer reference and some capture CurrentTick() as covering what they just
+		// recorded. The cursor is not used, because the call push_back above can dangle it.
+		FlushForCadence();
 	}
 }
 
@@ -760,13 +773,6 @@ static bool IndirectDrawOffsets(IndirectDrawRegisters registers, ShaderIndirectO
 		*slot = static_cast<uint8_t>(index);
 	}
 	return true;
-}
-
-void CommandProcessor::DrawIndirect(uint32_t data_offset, IndirectDrawRegisters registers,
-                                    uint32_t draw_initiator, bool indexed) {
-	const auto args_size =
-	    indexed ? sizeof(vk::DrawIndexedIndirectCommand) : sizeof(vk::DrawIndirectCommand);
-	DrawIndirectMulti(data_offset, 1, nullptr, args_size, registers, draw_initiator, indexed);
 }
 
 void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,

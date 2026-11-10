@@ -70,6 +70,9 @@ static void PrintUsage() {
 	         "                                       draws using a shader still being compiled are skipped.\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
 	::printf("  --occlusion-queries                  Count occlusion query samples on the GPU.\n");
+	::printf("  --gpu-submit-cadence                 Submit GPU work periodically while a long command\n"
+	         "                                       stream records, so the GPU starts sooner.\n");
+	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
 	::printf("  --command-buffer-dump                Enable command buffer dumps.\n");
@@ -204,6 +207,7 @@ static constexpr Flag FLAGS[] = {
     {"--no-async-shader-compile", &ConfigOptions::async_shader_compile_enabled, false},
     {"--tessellation", &ConfigOptions::tessellation_enabled},
     {"--occlusion-queries", &ConfigOptions::occlusion_queries_enabled},
+    {"--gpu-submit-cadence", &ConfigOptions::gpu_submit_cadence_enabled},
     {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},
     {"--graphics-debug-dump", &ConfigOptions::graphics_debug_dump_enabled},
     {"--profile", &ConfigOptions::profiler_enabled},
