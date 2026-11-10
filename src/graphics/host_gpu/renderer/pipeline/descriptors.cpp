@@ -812,6 +812,9 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	const auto& layout   = program.bindings;
 
 	prepared.buffers.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
+	if (prepared.rebind_cache.size() != prepared.buffers.size()) {
+		prepared.rebind_cache.assign(prepared.buffers.size(), {});
+	}
 	std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,
 	          prepared.shader_data.end(), 0);
 	auto pack_memory_offset = [&](uint32_t index, uint32_t offset) {
@@ -821,17 +824,40 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	};
 	{
 		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::NatBuf);
+		auto&                      buffer_cache = m_context.GetBufferCache();
 		for (const uint32_t resource_index: prepared.runtime->module->descriptor_buffers) {
 			const auto& resource = program.info.buffers[resource_index];
 			const auto  index    = resource.descriptor_index;
-			uint32_t    buffer_offset = 0;
-			prepared.buffers[index] = NativeStorageBuffer(
-			    m_context, prepared.buffer_sources[index], resource, buffer_offset,
-			    m_obtain_cache);
+			const auto& source   = prepared.buffer_sources[index];
+			auto&       entry    = prepared.rebind_cache[index];
+			// A read-only range that no CPU write touched since its last upload resolves to
+			// the same host block, so the descriptor and packed offset can be reused as-is.
+			const bool formatted =
+			    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled());
+			bool reusable = entry.valid && entry.source == source && source.address != 0 &&
+			                source.size != 0 && !resource.written && !formatted;
+			if (reusable) {
+				reusable = !buffer_cache.IsRegionCpuModified(source.address, source.size);
+			}
+			if (reusable) {
+				prepared.buffers[index] = entry.info;
+				pack_memory_offset(index, entry.shader_size -
+				                              static_cast<uint32_t>(source.size));
+				prepared.shader_data[layout.MemorySizeDword() + index] = entry.shader_size;
+				continue;
+			}
+			uint32_t buffer_offset = 0;
+			prepared.buffers[index] = NativeStorageBuffer(m_context, source, resource,
+			                                              buffer_offset, m_obtain_cache);
 			pack_memory_offset(index, buffer_offset);
 			// Null bindings allow 0 bytes, not the shared null buffer's 16, so no store reaches it.
-			prepared.shader_data[layout.MemorySizeDword() + index] =
-			    static_cast<uint32_t>(prepared.buffer_sources[index].size + buffer_offset);
+			const auto shader_size = static_cast<uint32_t>(source.size + buffer_offset);
+			prepared.shader_data[layout.MemorySizeDword() + index] = shader_size;
+			entry = {.source = source,
+			         .info   = prepared.buffers[index],
+			         .shader_size = shader_size,
+			         .valid       = source.address != 0 && source.size != 0 && !resource.written &&
+			                          !formatted};
 		}
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
