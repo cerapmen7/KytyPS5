@@ -659,6 +659,7 @@ void PipelineCache::Save() {
 }
 
 void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state) {
+	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::GraphicsPrograms);
 	const auto& context           = command.GetRegisters();
 	const auto& user_config       = command.GetUserConfig();
 	const auto& sh                = context.GetShaderRegisters();

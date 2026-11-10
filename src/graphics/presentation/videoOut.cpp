@@ -7,6 +7,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/perfProbe.h"
+#include "common/threadSampler.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -791,6 +792,7 @@ void VideoOutDriver::Impl::VblankEnd() {
 
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	using Clock           = std::chrono::steady_clock;
+	Common::Sampler::RegisterThread("present");
 	const auto refresh    = std::max(Config::GetVblankFrequency(), 1u);
 	const auto vblank_tick = Clock::duration(std::chrono::seconds(1)) / refresh;
 	// Ready frames are presented without waiting for the next vblank; the display still shows

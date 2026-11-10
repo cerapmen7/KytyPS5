@@ -227,8 +227,12 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 	// per-semantic dependent loads were the expensive part of this function.
 	std::array<uint32_t, ShaderVertexInputInfo::RES_MAX>     attrib_table {};
 	std::array<uint32_t, ShaderVertexInputInfo::RES_MAX * 4> buffer_table {};
-	std::memcpy(attrib_table.data(), attrib, sizeof(attrib_table));
-	std::memcpy(buffer_table.data(), buffer, sizeof(buffer_table));
+	{
+		Common::PerfProbe::Scope copy(Common::PerfProbe::Slot::StaticCopy);
+		std::memcpy(attrib_table.data(), attrib, sizeof(attrib_table));
+		std::memcpy(buffer_table.data(), buffer, sizeof(buffer_table));
+	}
+	Common::PerfProbe::Scope decode(Common::PerfProbe::Slot::StaticDecode);
 
 	if (count <= ShaderVertexInputInfo::RES_MAX) {
 		std::array<uint32_t, ShaderVertexInputInfo::RES_MAX> attrib_values {};

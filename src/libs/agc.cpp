@@ -4,7 +4,9 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfProbe.h"
 #include "common/stringUtils.h"
+#include "common/threadSampler.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -1516,7 +1518,26 @@ int KYTY_SYSV_ABI AgcSuspendPoint() {
 	PRINT_NAME();
 
 	EXIT_IF(g_renderer == nullptr);
-	g_renderer->GetGpu().SuspendPoint();
+	// Guest-side frame budget: time spent outside the submit wait. Comparing it with the
+	// GPU-thread `process` slot shows which side owns the frame.
+	static const bool registered = [] {
+		Common::Sampler::RegisterThread("guest-render");
+		return true;
+	}();
+	(void)registered;
+	if (Common::PerfProbe::Enabled()) {
+		static uint64_t last_ns = 0;
+		const auto      begin   = Common::PerfProbe::Now();
+		g_renderer->GetGpu().SuspendPoint();
+		const auto end = Common::PerfProbe::Now();
+		if (last_ns != 0) {
+			Common::PerfProbe::Add(Common::PerfProbe::Slot::GuestFrame, begin - last_ns);
+		}
+		Common::PerfProbe::Add(Common::PerfProbe::Slot::GuestWait, end - begin);
+		last_ns = end;
+	} else {
+		g_renderer->GetGpu().SuspendPoint();
+	}
 
 	return OK;
 }

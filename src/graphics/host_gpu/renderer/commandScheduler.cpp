@@ -176,7 +176,7 @@ void CommandScheduler::Finish() {
 		Submit();
 	}
 	{
-		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::GpuWait);
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::WaitFinish);
 		m_master.Wait(CurrentTick() - 1);
 	}
 	BeginNext();

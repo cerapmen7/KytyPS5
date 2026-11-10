@@ -1373,6 +1373,7 @@ static std::optional<DrawEmitInfo> ResolveDrawEmit(const HW::UserConfig&        
 bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::DrawIndexTotal);
+	Common::PerfProbe::Span  prefix(Common::PerfProbe::Slot::DrawPrefix);
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
@@ -1452,6 +1453,7 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 	}
 
 	const DrawCallInfo draw {true, args.index_count, args.instance_count};
+	prefix.Stop();
 	if (!PrepareDrawRenderState(buffer, draw, state)) {
 		ResetBindings();
 		return true;

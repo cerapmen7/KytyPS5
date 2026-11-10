@@ -304,7 +304,10 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		    [this, pending = std::move(pending)] { PublishDownload(pending); });
 	} else {
 		const auto tick = m_scheduler.CurrentTick();
-		m_scheduler.Wait(tick);
+		{
+			Common::PerfProbe::Scope wait(Common::PerfProbe::Slot::WaitDownload);
+			m_scheduler.Wait(tick);
+		}
 		m_scheduler.WaitPriorityOperations(tick);
 		PublishDownload(pending);
 	}
@@ -453,7 +456,10 @@ bool BufferCache::DownloadWithHotBuffers(BufferId main_id, Buffer& buffer, uint6
 		RecordDownload(*item.buffer, item.pending);
 	}
 	const auto tick = m_scheduler.CurrentTick();
-	m_scheduler.Wait(tick);
+	{
+		Common::PerfProbe::Scope wait(Common::PerfProbe::Slot::WaitDownload);
+		m_scheduler.Wait(tick);
+	}
 	m_scheduler.WaitPriorityOperations(tick);
 	for (const auto& item: batch) {
 		PublishDownload(item.pending);
@@ -943,7 +949,10 @@ void BufferCache::RunGarbageCollector() {
 
 	// Publish all queued downloads before releasing their tracked pages and owners.
 	const auto completion_tick = m_scheduler.CurrentTick();
-	m_scheduler.Wait(completion_tick);
+	{
+		Common::PerfProbe::Scope wait(Common::PerfProbe::Slot::WaitDownload);
+		m_scheduler.Wait(completion_tick);
+	}
 	m_scheduler.WaitPriorityOperations(completion_tick);
 	for (const auto id: dirty_buffers) {
 		auto& buffer = m_slot_buffers[id];

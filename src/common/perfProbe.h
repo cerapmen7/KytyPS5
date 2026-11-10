@@ -93,6 +93,22 @@ enum class Slot : uint32_t {
 	Upload,
 	Present,
 	GpuWait,
+	GuestFrame,
+	GuestWait,
+	DrawPrefix,
+	Dispatch,
+	DispatchProgram,
+	DispatchBindings,
+	DispatchCommit,
+	DispatchBarrier,
+	GraphicsPrograms,
+	DescWrite,
+	DescAlloc,
+	WaitFinish,
+	WaitDownload,
+	WaitFault,
+	WaitOccl,
+	StaticDecode,
 	Count,
 };
 
@@ -113,7 +129,10 @@ inline const char* Name(Slot slot) noexcept {
 	    "natobtain",   "gpfind",       "gpkey",        "hash_time",    "hash_hit",
 	    "hash_miss",   "statickey",    "staticcopy",   "depthonly",    "layered",
 	    "mrt",         "findimage",    "matclear",     "readback",     "sync",
-	    "upload",      "present",      "gpuwait",
+	    "upload",      "present",      "gpuwait",      "guestframe",   "guestwait",
+	    "drawprefix",  "dispatch",     "dispprog",     "dispbind",     "dispcommit",
+	    "dispbar",     "gpprep",       "descwrite",    "descalloc",    "waitfinish",
+	    "waitdownload", "waitfault",   "waitoccl",     "staticdecode",
 	};
 	static_assert(sizeof(names) / sizeof(names[0]) == SlotCount);
 	return names[static_cast<uint32_t>(slot)];
@@ -184,6 +203,26 @@ private:
 	uint64_t m_start;
 };
 
+// Same as Scope, but the measured range can be closed before the object dies so a
+// long function can time only its prefix.
+class Span final {
+public:
+	explicit Span(Slot slot) noexcept : m_slot(slot), m_start(Enabled() ? Now() : 0) {}
+	~Span() { Stop(); }
+	void Stop() noexcept {
+		if (m_start != 0) {
+			Add(m_slot, Now() - m_start);
+			m_start = 0;
+		}
+	}
+	Span(const Span&)            = delete;
+	Span& operator=(const Span&) = delete;
+
+private:
+	Slot     m_slot;
+	uint64_t m_start;
+};
+
 struct Snapshot {
 	uint64_t ns[SlotCount] {};
 	uint64_t calls[SlotCount] {};
@@ -219,6 +258,8 @@ inline bool IsAggregate(Slot slot) noexcept {
 	case Slot::StaticInfo:
 	case Slot::VertexBuffers:
 	case Slot::Flush:
+	case Slot::Dispatch:
+	case Slot::GraphicsPrograms:
 		return true;
 	default:
 		return false;

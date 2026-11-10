@@ -6,6 +6,7 @@
 #include "common/perfProbe.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
+#include "common/threadSampler.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
@@ -369,6 +370,7 @@ void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
+	Common::Sampler::RegisterThread("gpu");
 	g_gpu_state = gpu;
 
 	for (;;) {
