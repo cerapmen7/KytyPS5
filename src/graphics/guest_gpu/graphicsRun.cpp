@@ -547,8 +547,6 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		const auto        remaining_dw  = total_dw - cursor.offset_dw;
 		const auto        packet_header = packet[0];
 		const auto        opcode        = (packet_header >> 8u) & 0xffu;
-		// Packet census: the calls column of op_other is the front-end packet count.
-		Common::PerfProbe::Add(Common::PerfProbe::Slot::OpOther, 0);
 
 		// Zero-code NOP fillers carry no state; skip them without a handler call.
 		if (opcode == Pm4::IT_NOP && KYTY_PM4_R(packet_header) == Pm4::R_ZERO) {
