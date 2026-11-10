@@ -698,10 +698,17 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 		ranges[range_count++] = {vertex.addr, vertex.addr + size};
 	}
 
-	std::sort(ranges.begin(), ranges.begin() + range_count,
-	          [](const VertexBufferRange& left, const VertexBufferRange& right) {
-		          return left.base_address < right.base_address;
-	          });
+	// At most RES_MAX (32) ranges: an insertion sort beats std::sort's partitioning here and
+	// this runs once per draw.
+	for (uint32_t i = 1; i < range_count; i++) {
+		const auto range = ranges[i];
+		uint32_t   j     = i;
+		while (j != 0 && ranges[j - 1].base_address > range.base_address) {
+			ranges[j] = ranges[j - 1];
+			j--;
+		}
+		ranges[j] = range;
+	}
 
 	// Merge overlapping or touching ranges before acquiring host buffers.
 	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> merged_ranges {};

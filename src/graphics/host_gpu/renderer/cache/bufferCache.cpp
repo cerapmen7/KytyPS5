@@ -672,9 +672,12 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
 	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Sync);
-	std::vector<vk::BufferCopy> copies;
-	uint64_t                    total_size = 0;
-	vk::Buffer                  source;
+	// ObtainBuffer reaches this path thousands of times per frame; a scratch vector per call
+	// showed up as allocator traffic on the GPU thread.
+	static thread_local std::vector<vk::BufferCopy> copies;
+	copies.clear();
+	uint64_t   total_size = 0;
+	vk::Buffer source;
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
 	    [&](uint64_t address, uint64_t bytes) noexcept {
