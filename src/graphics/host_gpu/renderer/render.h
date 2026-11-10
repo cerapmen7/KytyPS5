@@ -134,6 +134,50 @@ namespace Pssr {
 struct Request;
 }
 
+class Buffer;
+
+// Reuses one ObtainBuffer result for repeated (address, size, flags) within a single draw.
+// The guest can rewrite the memory between draws; Clear() at each draw boundary keeps it safe.
+struct BufferObtainCache {
+	struct Entry {
+		uint64_t address   = 0;
+		uint64_t size      = 0;
+		BufferId id        = {};
+		bool     written   = false;
+		bool     formatted = false;
+		Buffer*  buffer    = nullptr;
+		uint64_t offset    = 0;
+	};
+
+	static constexpr uint32_t Capacity = 64;
+	std::array<Entry, Capacity> entries {};
+	uint32_t                    count = 0;
+
+	void Clear() noexcept { count = 0; }
+
+	[[nodiscard]] bool Find(uint64_t address, uint64_t size, BufferId id, bool written,
+	                        bool formatted, Buffer*& buffer, uint64_t& offset) noexcept {
+		for (uint32_t i = 0; i < count; i++) {
+			const auto& entry = entries[i];
+			if (entry.address == address && entry.size == size && entry.id == id &&
+			    entry.written == written && entry.formatted == formatted) {
+				buffer = entry.buffer;
+				offset = entry.offset;
+				return true;
+			}
+		}
+		return false;
+	}
+
+	void Add(uint64_t address, uint64_t size, BufferId id, bool written, bool formatted,
+	         Buffer* buffer, uint64_t offset) noexcept {
+		if (count >= Capacity) {
+			return;
+		}
+		entries[count++] = {address, size, id, written, formatted, buffer, offset};
+	}
+};
+
 class RenderExecutor {
 public:
 	explicit RenderExecutor(RenderContext& context): m_context(context) {}
@@ -198,6 +242,7 @@ private:
 	RenderContext&                        m_context;
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
+	BufferObtainCache                    m_obtain_cache;
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;

@@ -107,7 +107,8 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
-                    const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset) {
+                    const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset,
+                    BufferObtainCache& cache) {
 	buffer_offset = 0;
 
 	const auto& [address, size, id] = source;
@@ -120,12 +121,18 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	if (size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
 		EXIT("storage buffer range is unsupported\n");
 	}
-	auto [buffer, offset] = [&] {
+	const bool formatted =
+	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled());
+	Buffer*  buffer = nullptr;
+	uint64_t offset = 0;
+	if (!cache.Find(address, size, id, resource.written, formatted, buffer, offset)) {
 		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::NatObtain);
-		return context.GetBufferCache().ObtainBuffer(
-		    address, size, resource.written,
-		    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id);
-	}();
+		const auto obtained = context.GetBufferCache().ObtainBuffer(
+		    address, size, resource.written, formatted, id);
+		buffer = obtained.first;
+		offset = obtained.second;
+		cache.Add(address, size, id, resource.written, formatted, buffer, offset);
+	}
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
@@ -819,7 +826,8 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			const auto  index    = resource.descriptor_index;
 			uint32_t    buffer_offset = 0;
 			prepared.buffers[index] = NativeStorageBuffer(
-			    m_context, prepared.buffer_sources[index], resource, buffer_offset);
+			    m_context, prepared.buffer_sources[index], resource, buffer_offset,
+			    m_obtain_cache);
 			pack_memory_offset(index, buffer_offset);
 			// Null bindings allow 0 bytes, not the shared null buffer's 16, so no store reaches it.
 			prepared.shader_data[layout.MemorySizeDword() + index] =
