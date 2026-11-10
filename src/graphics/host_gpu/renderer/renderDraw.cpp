@@ -853,31 +853,51 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 	return false;
 }
 
-bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
-                                            DrawRenderState& state) {
-	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Programs);
-	// Opt-in performance experiment: KYTY_SKIP_DEPTH_ONLY=1 drops the shadow/depth-only
-	// passes. CB_TARGET_MASK == 0 means the pixel shader writes no colour channel, so the
-	// pass only exists to fill a depth target. Tested before any program work so the skipped
-	// draws cost nothing. Read once; off unless the lab asks for it.
-	static const bool skip_depth_only = [] {
+// Opt-in performance experiment: KYTY_SKIP_DEPTH_ONLY=1 drops the shadow/depth-only passes.
+// Read once; off unless the lab asks for it.
+static bool SkipDepthOnlyEnabled() {
+	static const bool enabled = [] {
 		const auto* const value = std::getenv("KYTY_SKIP_DEPTH_ONLY");
 		return value != nullptr && *value != '\0' && std::strtoul(value, nullptr, 10) != 0;
 	}();
-	if (skip_depth_only) {
-		const auto& hw          = buffer.GetRegisters();
-		const auto& z           = hw.GetDepthRenderTarget();
-		bool        color_bound = false;
-		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
-			if (hw.GetRenderTarget(slot).base.addr != 0) {
-				color_bound = true;
-				break;
-			}
+	return enabled;
+}
+
+// Mirrors the colour-output mask PipelineCache::GetGraphicsPrograms derives from the shader
+// registers, so a pass that exports no colour is recognised before any program work.
+static uint32_t RegisterColorOutputMask(const HW::Context& context) {
+	const auto& sh         = context.GetShaderRegisters();
+	const auto  write_mask = context.GetRenderTargetMask() & sh.m_cbShaderMask;
+	uint32_t    mask       = context.HasObjectPrimitiveIdOutput() ? 1u << 7u : 0;
+	for (uint32_t index = 0; index < RENDER_COLOR_ATTACHMENTS_MAX; index++) {
+		const auto slot = ShaderPixelExportTarget(sh.m_cbShaderMask, index);
+		if (slot >= RENDER_COLOR_ATTACHMENTS_MAX) {
+			break;
 		}
-		if (!color_bound && (z.z_write_base_addr != 0 || z.stencil_write_base_addr != 0)) {
-			Common::PerfProbe::Add(Common::PerfProbe::Slot::DepthOnlyDraw, 0);
-			return false;
+		if (sh.target_output_mode[index] != 0 && render_target_mask_slot(write_mask, slot) != 0) {
+			mask |= 1u << slot;
 		}
+	}
+	return mask;
+}
+
+// A draw that exports no colour and writes depth only feeds shadow cascades and depth
+// prepasses; it cannot change the presented image by itself.
+static bool IsDepthOnlyDraw(const CommandBuffer& buffer) {
+	const auto& context = buffer.GetRegisters();
+	if (RegisterColorOutputMask(context) != 0) {
+		return false;
+	}
+	const auto& z = context.GetDepthRenderTarget();
+	return z.z_write_base_addr != 0 || z.stencil_write_base_addr != 0;
+}
+
+bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
+                                            DrawRenderState& state) {
+	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Programs);
+	if (SkipDepthOnlyEnabled() && IsDepthOnlyDraw(buffer)) {
+		Common::PerfProbe::Add(Common::PerfProbe::Slot::DepthOnlyDraw, 0);
+		return false;
 	}
 	m_context.GetImageHeap().BeginDraw();
 	m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
@@ -938,7 +958,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	// a quality/performance trade could remove, so count them with the other draw shapes.
 	if (state.color_count == 0 && state.depth_info.image_id) {
 		Common::PerfProbe::Add(Common::PerfProbe::Slot::DepthOnlyDraw, 0);
-		if (skip_depth_only) {
+		if (SkipDepthOnlyEnabled()) {
 			return false;
 		}
 	}
@@ -1374,6 +1394,12 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 		return true;
 	}
 
+	// Skip depth-only passes before the per-draw setup, not just before the program work.
+	if (SkipDepthOnlyEnabled() && IsDepthOnlyDraw(buffer)) {
+		Common::PerfProbe::Add(Common::PerfProbe::Slot::DepthOnlyDraw, 0);
+		return true;
+	}
+
 	if (graphics_debug_dump_enabled()) {
 		LOGF("GraphicsRenderDrawIndex():Shader:\n");
 		uc_print("GraphicsRenderDrawIndex():UserConfig:", ucfg);
@@ -1464,6 +1490,12 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
+		return true;
+	}
+
+	// Skip depth-only passes before the per-draw setup, not just before the program work.
+	if (SkipDepthOnlyEnabled() && IsDepthOnlyDraw(buffer)) {
+		Common::PerfProbe::Add(Common::PerfProbe::Slot::DepthOnlyDraw, 0);
 		return true;
 	}
 
