@@ -105,9 +105,6 @@ private:
 	std::jthread                 m_priority_thread;
 	uint64_t                     m_priority_active_tick = 0; // 0 while none runs
 	uint32_t                     m_overlap_draws        = 0;
-	// Bumped by every Current() call, reset when a new command buffer starts recording, so a
-	// flush can tell an empty command buffer from one holding work.
-	uint64_t                     m_recorded_commands    = 0;
 	OperationState               m_operation_state      = OperationState::Open;
 };
 

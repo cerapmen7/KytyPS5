@@ -138,21 +138,7 @@ void CommandScheduler::Begin(HW::Context& registers, HW::UserConfig& user_config
 	}
 }
 
-// Opt-in experiment: KYTY_SKIP_EMPTY_FLUSH=1 drops the submit a flush would make when nothing
-// was recorded since the last one. The guest flush command is issued far more often than work
-// arrives, and each empty submit still costs a vkQueueSubmit on the GPU thread.
-static bool SkipEmptyFlushEnabled() {
-	static const bool enabled = [] {
-		const auto* const value = std::getenv("KYTY_SKIP_EMPTY_FLUSH");
-		return value != nullptr && *value != '\0' && std::strtoul(value, nullptr, 10) != 0;
-	}();
-	return enabled;
-}
-
 void CommandScheduler::Flush() {
-	if (SkipEmptyFlushEnabled() && m_recorded_commands == 0) {
-		return;
-	}
 	SubmitInfo submit;
 	Flush(submit);
 }
@@ -352,7 +338,6 @@ void CommandScheduler::CheckActive() const {
 
 CommandBuffer& CommandScheduler::Current() {
 	EXIT_IF(m_command.IsInvalid());
-	m_recorded_commands++;
 	return m_command;
 }
 
@@ -361,7 +346,6 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
 	m_dynamic_state.Invalidate();
-	m_recorded_commands = 0;
 	return m_command;
 }
 
