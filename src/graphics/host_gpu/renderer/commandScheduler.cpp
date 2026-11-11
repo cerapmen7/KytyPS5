@@ -2,9 +2,11 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/perfProbe.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <optional>
 
 namespace Libs::Graphics {
@@ -142,8 +144,30 @@ void CommandScheduler::Flush() {
 }
 
 void CommandScheduler::Flush(SubmitInfo& submit) {
-	Submit(submit);
+	{
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Submit);
+		Submit(submit);
+	}
 	BeginNext();
+}
+
+void CommandScheduler::FlushForOverlap() {
+	static const uint32_t interval = [] {
+		const auto* const value = std::getenv("KYTY_OVERLAP_DRAWS");
+		if (value == nullptr || *value == '\0') {
+			return 32u;
+		}
+		return static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+	}();
+	if (interval == 0 || m_command.IsInvalid()) {
+		return;
+	}
+	if (++m_overlap_draws < interval) {
+		return;
+	}
+	m_overlap_draws = 0;
+	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Flush);
+	Flush();
 }
 
 void CommandScheduler::Finish() {
@@ -151,7 +175,10 @@ void CommandScheduler::Finish() {
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
-	m_master.Wait(CurrentTick() - 1);
+	{
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::WaitFinish);
+		m_master.Wait(CurrentTick() - 1);
+	}
 	BeginNext();
 	PopPendingOperations();
 }
@@ -163,11 +190,18 @@ void CommandScheduler::Wait(uint64_t tick) {
 		// A stream-buffer wrap can wait while a draw is being prepared through a reference to
 		// Current(). The wrapper stays stable while its pooled Vulkan buffer is retired. Deferred
 		// resources are released only at the next GPU operation boundary.
-		const auto submitted_tick = Submit();
+		const auto submitted_tick = [&] {
+			Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Submit);
+			return Submit();
+		}();
 		EXIT_IF(submitted_tick != tick);
-		m_master.Wait(tick);
+		{
+			Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::GpuWait);
+			m_master.Wait(tick);
+		}
 		BeginNext();
 	} else {
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::GpuWait);
 		m_master.Wait(tick);
 	}
 }

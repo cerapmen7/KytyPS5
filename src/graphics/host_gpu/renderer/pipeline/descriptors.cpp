@@ -6,6 +6,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfProbe.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -108,7 +109,8 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
-                    const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset) {
+                    const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset,
+                    BufferObtainCache& cache) {
 	buffer_offset = 0;
 
 	const auto& [address, size, id] = source;
@@ -121,9 +123,18 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	if (size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
 		EXIT("storage buffer range is unsupported\n");
 	}
-	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(
-	    address, size, resource.written,
-	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id);
+	const bool formatted =
+	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled());
+	Buffer*  buffer = nullptr;
+	uint64_t offset = 0;
+	if (!cache.Find(address, size, id, resource.written, formatted, buffer, offset)) {
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::NatObtain);
+		const auto obtained = context.GetBufferCache().ObtainBuffer(
+		    address, size, resource.written, formatted, id);
+		buffer = obtained.first;
+		offset = obtained.second;
+		cache.Add(address, size, id, resource.written, formatted, buffer, offset);
+	}
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
@@ -704,6 +715,7 @@ void RenderExecutor::BindRenderTarget(ImageId id) {
 }
 
 void RenderExecutor::ResetBindings() {
+	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::ResetBindings);
 	for (const auto id: m_bound_images) {
 		m_context.GetTextureCache().m_slot_images[id].binding = {};
 	}
@@ -713,6 +725,7 @@ void RenderExecutor::ResetBindings() {
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
+	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::PrepareStages);
 	EXIT_IF(!runtime);
 	const auto& program  = runtime.module->info;
 	const auto& snapshot = *runtime.resources;
@@ -752,6 +765,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 
 void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	KYTY_PROFILER_FUNCTION();
+	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::FindBuffers);
 	auto& cache = m_context.GetBufferCache();
 	for (auto* stage: stages) {
 		auto&       prepared = *stage;
@@ -762,9 +776,8 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 		if (layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)] == 0) {
 			continue;
 		}
-		for (uint32_t resource = 0; resource < program.info.buffers.size(); ++resource) {
+		for (const uint32_t resource: prepared.runtime->module->descriptor_buffers) {
 			const auto& metadata = program.info.buffers[resource];
-			if (metadata.descriptor_index == UINT32_MAX) continue;
 			auto& source = prepared.buffer_sources[metadata.descriptor_index];
 			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
 			const auto address = descriptor.Base48();
@@ -811,11 +824,15 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
+	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::RebindBuffers);
 	const auto& program  = prepared.runtime->module->info;
 	const auto& snapshot = *prepared.runtime->resources;
 	const auto& layout   = program.bindings;
 
 	prepared.buffers.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
+	if (prepared.rebind_cache.size() != prepared.buffers.size()) {
+		prepared.rebind_cache.assign(prepared.buffers.size(), {});
+	}
 	std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,
 	          prepared.shader_data.end(), 0);
 	auto pack_memory_offset = [&](uint32_t index, uint32_t offset) {
@@ -823,16 +840,43 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const auto shift = (index % 4u) * 8u;
 		prepared.shader_data[dword] |= offset << shift;
 	};
-	for (const auto& resource: program.info.buffers) {
-		const auto index = resource.descriptor_index;
-		if (index == UINT32_MAX) continue;
-		uint32_t buffer_offset = 0;
-		prepared.buffers[index] = NativeStorageBuffer(m_context, prepared.buffer_sources[index],
-		                                              resource, buffer_offset);
-		pack_memory_offset(index, buffer_offset);
-		// Null bindings allow 0 bytes, not the shared null buffer's 16, so no store reaches it.
-		prepared.shader_data[layout.MemorySizeDword() + index] =
-		    static_cast<uint32_t>(prepared.buffer_sources[index].size + buffer_offset);
+	{
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::NatBuf);
+		auto&                      buffer_cache = m_context.GetBufferCache();
+		for (const uint32_t resource_index: prepared.runtime->module->descriptor_buffers) {
+			const auto& resource = program.info.buffers[resource_index];
+			const auto  index    = resource.descriptor_index;
+			const auto& source   = prepared.buffer_sources[index];
+			auto&       entry    = prepared.rebind_cache[index];
+			// A read-only range that no CPU write touched since its last upload resolves to
+			// the same host block, so the descriptor and packed offset can be reused as-is.
+			const bool formatted =
+			    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled());
+			bool reusable = entry.valid && entry.source == source && source.address != 0 &&
+			                source.size != 0 && !resource.written && !formatted;
+			if (reusable) {
+				reusable = !buffer_cache.IsRegionCpuModified(source.address, source.size);
+			}
+			if (reusable) {
+				prepared.buffers[index] = entry.info;
+				pack_memory_offset(index, entry.shader_size -
+				                              static_cast<uint32_t>(source.size));
+				prepared.shader_data[layout.MemorySizeDword() + index] = entry.shader_size;
+				continue;
+			}
+			uint32_t buffer_offset = 0;
+			prepared.buffers[index] = NativeStorageBuffer(m_context, source, resource,
+			                                              buffer_offset, m_obtain_cache);
+			pack_memory_offset(index, buffer_offset);
+			// Null bindings allow 0 bytes, not the shared null buffer's 16, so no store reaches it.
+			const auto shader_size = static_cast<uint32_t>(source.size + buffer_offset);
+			prepared.shader_data[layout.MemorySizeDword() + index] = shader_size;
+			entry = {.source = source,
+			         .info   = prepared.buffers[index],
+			         .shader_size = shader_size,
+			         .valid       = source.address != 0 && source.size != 0 && !resource.written &&
+			                          !formatted};
+		}
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
@@ -844,6 +888,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
+	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::RebindImages);
 	const auto& program       = prepared.runtime->module->info;
 	const auto& snapshot      = *prepared.runtime->resources;
 	auto&       images        = prepared.images;
@@ -1085,14 +1130,20 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 
 	if (!m_descriptor_writes.empty()) {
 		if (pipeline.uses_push_descriptors) {
+			Common::PerfProbe::Scope write(Common::PerfProbe::Slot::DescWrite);
 			vk_buffer.pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, 0,
 			                               static_cast<uint32_t>(m_descriptor_writes.size()),
 			                               m_descriptor_writes.data());
 		} else {
-			const auto set = m_context.GetDescriptorHeap().Commit(pipeline.descriptor_set_layout);
+			vk::DescriptorSet set;
+			{
+				Common::PerfProbe::Scope alloc(Common::PerfProbe::Slot::DescAlloc);
+				set = m_context.GetDescriptorHeap().Commit(pipeline.descriptor_set_layout);
+			}
 			for (auto& write: m_descriptor_writes) {
 				write.dstSet = set;
 			}
+			Common::PerfProbe::Scope write(Common::PerfProbe::Slot::DescWrite);
 			m_context.GetGraphics().device.updateDescriptorSets(
 			    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data(), 0,
 			    nullptr);

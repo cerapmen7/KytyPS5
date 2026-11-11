@@ -3,8 +3,10 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
+#include "common/perfProbe.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
+#include "common/threadSampler.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
@@ -390,6 +392,7 @@ void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
+	Common::Sampler::RegisterThread("gpu");
 	g_gpu_state = gpu;
 
 	for (;;) {
@@ -486,6 +489,7 @@ void GuestGpu::ThreadRun(void* data) {
 }
 
 bool GuestGpu::Process(Submission& submission) {
+	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Process);
 	auto& cp = GetProcessor(submission.queue_id);
 
 	cp.BufferInit();
@@ -549,9 +553,11 @@ void CommandProcessor::SuspendPm4() {
 }
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
+	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Pm4);
 	const bool debug_dump = graphics_debug_dump_enabled();
 	while (!execution.m_buffer_stack.empty()) {
-		if (g_gpu_state != nullptr) {
+		if (g_gpu_state != nullptr && g_gpu_state->HasPendingCommands()) {
+			Common::PerfProbe::Scope pending(Common::PerfProbe::Slot::PendingOps);
 			g_gpu_state->ProcessCommands();
 		}
 		auto& cursor = execution.m_buffer_stack.back();
@@ -565,6 +571,15 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		const auto        remaining_dw  = total_dw - cursor.offset_dw;
 		const auto        packet_header = packet[0];
 		const auto        opcode        = (packet_header >> 8u) & 0xffu;
+
+		// Zero-code NOP fillers carry no state; skip them without a handler call.
+		if (opcode == Pm4::IT_NOP && KYTY_PM4_R(packet_header) == Pm4::R_ZERO) {
+			const auto packet_dw = KYTY_PM4_LEN(packet_header);
+			EXIT_NOT_IMPLEMENTED(packet_dw == 0 || packet_dw > remaining_dw);
+			cursor.offset_dw += packet_dw;
+			execution.m_made_progress = true;
+			continue;
+		}
 
 		if (packet_header == 0x80000000u || Pm4::PacketSizeDw(packet_header) == 1u) {
 			cursor.offset_dw++;

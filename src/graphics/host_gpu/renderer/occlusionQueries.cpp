@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/occlusionQueries.h"
 
+#include "common/perfProbe.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
@@ -54,6 +55,7 @@ void OcclusionQueries::Dump(uint64_t address) {
 
 void OcclusionQueries::PublishDumps() {
 	if (const auto last = m_dumps.back().queries; last != m_read) {
+		Common::PerfProbe::Scope wait(Common::PerfProbe::Slot::WaitOccl);
 		m_scheduler.Wait(m_dumps.back().tick);
 		// The unread queries wrap around the pool at most once.
 		for (uint64_t read = m_read; read < last;) {

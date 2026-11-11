@@ -6,6 +6,8 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfProbe.h"
+#include "common/threadSampler.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -787,10 +789,17 @@ void VideoOutDriver::Impl::VblankEnd() {
 }
 
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
-	using Clock       = std::chrono::steady_clock;
-	const auto period = Clock::duration(std::chrono::seconds(1)) / Config::GetVblankFrequency();
+	using Clock           = std::chrono::steady_clock;
+	Common::Sampler::RegisterThread("present");
+	const auto refresh    = std::max(Config::GetVblankFrequency(), 1u);
+	const auto vblank_tick = Clock::duration(std::chrono::seconds(1)) / refresh;
+	// Ready frames are presented without waiting for the next vblank; the display still shows
+	// the latest image at the vblank, but the guest can start its next frame as soon as the GPU
+	// is done.
+	const auto poll_tick = std::chrono::milliseconds(1);
 
 	std::chrono::nanoseconds total_wait {};
+	Clock::time_point        next_vblank {};
 	while (!token.stop_requested()) {
 		const auto sleep_begin = Clock::now();
 		if (total_wait.count() > 0) {
@@ -802,15 +811,28 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		const auto frame_begin = Clock::now();
 		total_wait -= frame_begin - sleep_begin;
 
-		VblankBegin();
-		bool presented = m_flip_queue.Flip();
-		if (!presented && m_presenter.NeedsSystemOverlayRefresh()) {
-			if (!m_presenter.PresentLastFrame()) {
-				m_presenter.Present(m_presenter.PrepareBlankFrame(width, height, true));
-			}
-			presented = true;
+		const bool vblank_due = next_vblank == Clock::time_point {} || frame_begin >= next_vblank;
+		if (vblank_due) {
+			next_vblank = frame_begin + vblank_tick;
+			VblankBegin();
 		}
-		if (!presented && total_wait.count() < 0) {
+		bool guest_frame = false;
+		bool presented   = false;
+		{
+			Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Present);
+			guest_frame = m_flip_queue.Flip();
+			presented   = guest_frame;
+			if (!presented && m_presenter.NeedsSystemOverlayRefresh()) {
+				if (!m_presenter.PresentLastFrame()) {
+					m_presenter.Present(m_presenter.PrepareBlankFrame(width, height, true));
+				}
+				presented = true;
+			}
+		}
+		if (guest_frame) {
+			Common::PerfProbe::EndFrame();
+		}
+		if (!presented && vblank_due && total_wait.count() < 0) {
 			bool any_open = false;
 			{
 				Common::LockGuard lock(m_mutex);
@@ -822,11 +844,16 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 				m_presenter.Present(m_presenter.PrepareBlankFrame(width, height, true));
 			}
 		}
-		VblankEnd();
+		if (vblank_due) {
+			VblankEnd();
+		}
 
-		total_wait += period - (Clock::now() - frame_begin);
+		total_wait += poll_tick - (Clock::now() - frame_begin);
 		if (total_wait.count() < 0) {
-			Common::DebugCounters::Add(Common::DebugCounters::Counter::LateVblanks);
+			total_wait = std::chrono::nanoseconds::zero();
+			if (vblank_due) {
+				Common::DebugCounters::Add(Common::DebugCounters::Counter::LateVblanks);
+			}
 		}
 	}
 }

@@ -251,6 +251,16 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 	data->right_stick_y     = state.axes[static_cast<int>(Axis::RightY)];
 	data->analog_buttons_l2 = state.axes[static_cast<int>(Axis::TriggerLeft)];
 	data->analog_buttons_r2 = state.axes[static_cast<int>(Axis::TriggerRight)];
+	// Keyboard or gamepad mappings may only drive the trigger buttons. Games that read the
+	// analog trigger value would otherwise never see L2/R2, which breaks menus and actions.
+	if (data->analog_buttons_l2 == 0 &&
+	    (state.buttons & PAD_BUTTON_L2) != 0) {
+		data->analog_buttons_l2 = 255;
+	}
+	if (data->analog_buttons_r2 == 0 &&
+	    (state.buttons & PAD_BUTTON_R2) != 0) {
+		data->analog_buttons_r2 = 255;
+	}
 	data->acceleration_x     = state.accel[0];
 	data->acceleration_y     = state.accel[1];
 	data->acceleration_z     = state.accel[2];

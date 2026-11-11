@@ -25,6 +25,9 @@ public:
 	void           EndRendering() { m_command.EndRendering(); }
 	void           Flush();
 	void           Flush(SubmitInfo& submit);
+	// Submit completed draws periodically so the GPU can start executing the frame before the
+	// whole command stream has been recorded. KYTY_OVERLAP_DRAWS sets the interval (0 disables).
+	void           FlushForOverlap();
 	void           Finish();
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
@@ -97,6 +100,7 @@ private:
 	std::condition_variable      m_operation_available;
 	std::jthread                 m_priority_thread;
 	uint64_t                     m_priority_active_tick = 0; // 0 while none runs
+	uint32_t                     m_overlap_draws        = 0;
 	OperationState               m_operation_state      = OperationState::Open;
 };
 

@@ -87,6 +87,9 @@ static void PrintUsage() {
 	::printf("  --sync-raw-image-buffers             Synchronize raw reads of GPU images.\n");
 	::printf(
 	    "  --flush-draws <num>                  Submit GPU work every <num> draws; 0 is off.\n");
+	::printf("  --batch-hot-readbacks                When a fault readback waits for the GPU, also read\n"
+	         "                                       back recently faulted buffers and finished small\n"
+	         "                                       GPU writes.\n");
 	::printf("  --no-trophy-notifications            Disable trophy unlock toasts and their sound.\n");
 	::printf(
 	    "  --trophy-duration <seconds>          Trophy toast duration, 5-10. Default: 6.\n");
@@ -214,6 +217,7 @@ static constexpr Flag FLAGS[] = {
     {"--readback-tiled-images", &ConfigOptions::readback_tiled_images},
     {"--readback-storage-images", &ConfigOptions::readback_storage_images},
     {"--sync-raw-image-buffers", &ConfigOptions::sync_raw_image_buffers},
+    {"--batch-hot-readbacks", &ConfigOptions::batch_hot_readbacks},
     {"--no-trophy-notifications", &ConfigOptions::trophy_enabled, false},
     {"--perf-overlay", &ConfigOptions::perf_overlay_enabled},
     {"--playgo-hack", &ConfigOptions::playgo_hack_enabled},

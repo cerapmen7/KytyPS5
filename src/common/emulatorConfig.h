@@ -77,7 +77,7 @@ struct ConfigOptions {
 	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
-	bool                   shader_cache_enabled        = false;
+	bool                   shader_cache_enabled        = true;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
 	bool                   command_buffer_dump_enabled = false;
@@ -94,8 +94,9 @@ struct ConfigOptions {
 	bool                   readback_storage_images     = false;
 	bool                   sync_raw_image_buffers      = false;
 	uint32_t               flush_draws                 = 0; // 0 is off
+	bool                   batch_hot_readbacks         = false;
 	bool                   tessellation_enabled        = false;
-	bool                   occlusion_queries_enabled   = false;
+	bool                   occlusion_queries_enabled   = true;
 	bool                   relaxed_shader_float        = false;
 	bool                   lod_stats_enabled           = false;
 	bool                   trophy_enabled              = true;
@@ -171,6 +172,9 @@ bool ReadbackTiledImagesEnabled();
 bool ReadbackStorageImagesEnabled();
 bool SyncRawImageBuffersEnabled();
 uint32_t GetFlushDraws();
+// Makes a fault readback that waits for the GPU also read back GPU-written bytes of buffers that
+// recently faulted.
+bool BatchHotReadbacksEnabled();
 bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
 bool RelaxedShaderFloatEnabled();

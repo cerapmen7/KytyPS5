@@ -6,6 +6,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfProbe.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -682,10 +683,17 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 		ranges[range_count++] = {vertex.addr, vertex.addr + size};
 	}
 
-	std::sort(ranges.begin(), ranges.begin() + range_count,
-	          [](const VertexBufferRange& left, const VertexBufferRange& right) {
-		          return left.base_address < right.base_address;
-	          });
+	// At most RES_MAX (32) ranges: an insertion sort beats std::sort's partitioning here and
+	// this runs once per draw.
+	for (uint32_t i = 1; i < range_count; i++) {
+		const auto range = ranges[i];
+		uint32_t   j     = i;
+		while (j != 0 && ranges[j - 1].base_address > range.base_address) {
+			ranges[j] = ranges[j - 1];
+			j--;
+		}
+		ranges[j] = range;
+	}
 
 	// Merge overlapping or touching ranges before acquiring host buffers.
 	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> merged_ranges {};
@@ -830,8 +838,52 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 	return false;
 }
 
+// Opt-in performance experiment: KYTY_SKIP_DEPTH_ONLY=1 drops the shadow/depth-only passes.
+// Read once; off unless the lab asks for it.
+static bool SkipDepthOnlyEnabled() {
+	static const bool enabled = [] {
+		const auto* const value = std::getenv("KYTY_SKIP_DEPTH_ONLY");
+		return value != nullptr && *value != '\0' && std::strtoul(value, nullptr, 10) != 0;
+	}();
+	return enabled;
+}
+
+// Mirrors the colour-output mask PipelineCache::GetGraphicsPrograms derives from the shader
+// registers, so a pass that exports no colour is recognised before any program work.
+static uint32_t RegisterColorOutputMask(const HW::Context& context) {
+	const auto& sh         = context.GetShaderRegisters();
+	const auto  write_mask = context.GetRenderTargetMask() & sh.m_cbShaderMask;
+	uint32_t    mask       = context.HasObjectPrimitiveIdOutput() ? 1u << 7u : 0;
+	for (uint32_t index = 0; index < RENDER_COLOR_ATTACHMENTS_MAX; index++) {
+		const auto slot = ShaderPixelExportTarget(sh.m_cbShaderMask, index);
+		if (slot >= RENDER_COLOR_ATTACHMENTS_MAX) {
+			break;
+		}
+		if (sh.target_output_mode[index] != 0 && render_target_mask_slot(write_mask, slot) != 0) {
+			mask |= 1u << slot;
+		}
+	}
+	return mask;
+}
+
+// A draw that exports no colour and writes depth only feeds shadow cascades and depth
+// prepasses; it cannot change the presented image by itself.
+static bool IsDepthOnlyDraw(const CommandBuffer& buffer) {
+	const auto& context = buffer.GetRegisters();
+	if (RegisterColorOutputMask(context) != 0) {
+		return false;
+	}
+	const auto& z = context.GetDepthRenderTarget();
+	return z.z_write_base_addr != 0 || z.stencil_write_base_addr != 0;
+}
+
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             DrawRenderState& state) {
+	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Programs);
+	if (SkipDepthOnlyEnabled() && IsDepthOnlyDraw(buffer)) {
+		Common::PerfProbe::Add(Common::PerfProbe::Slot::DepthOnlyDraw, 0);
+		return false;
+	}
 	m_context.GetImageHeap().BeginDraw();
 	m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
 	// Vertex programs beyond the host mesh limits or with unsupported call targets are not
@@ -886,6 +938,21 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	if (targets.color_count == 0 && !targets.depth.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), targets.depth, buffer, draw.index_count, 0);
 		return false;
+	}
+
+	// Draw mix: depth-only passes (shadow cascades and depth prepasses) are the only GPU work
+	// a quality/performance trade could remove, so count them with the other draw shapes.
+	if (targets.color_count == 0 && targets.depth.image_id) {
+		Common::PerfProbe::Add(Common::PerfProbe::Slot::DepthOnlyDraw, 0);
+		if (SkipDepthOnlyEnabled()) {
+			return false;
+		}
+	}
+	if (targets.color_count > 1) {
+		Common::PerfProbe::Add(Common::PerfProbe::Slot::MrtDraw, 0);
+	}
+	if (targets.depth.image_id && targets.depth.desc.info.extent.depth > 1) {
+		Common::PerfProbe::Add(Common::PerfProbe::Slot::LayeredDraw, 0);
 	}
 
 	return true;
@@ -1045,6 +1112,8 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
                                          const DrawRenderState& state, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source) {
+	Common::PerfProbe::Scope draw_probe(Common::PerfProbe::Slot::DrawTotal);
+	m_obtain_cache.Clear();
 	auto&      ucfg                     = buffer.GetUserConfig();
 	const bool primitive_restart_enable = state.primitive_restart_enable;
 	if (CopyDepthToColor(buffer, draw, emit, state)) {
@@ -1100,20 +1169,25 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
-	for (uint32_t i = 0; i < vertex_stages.size(); i++) {
-		PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
-		descriptor_stages[stage_count++] = &bindings.vertex[i];
+	std::span<PreparedBindings* const> stages;
+	{
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Bindings);
+		for (uint32_t i = 0; i < vertex_stages.size(); i++) {
+			PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
+			descriptor_stages[stage_count++] = &bindings.vertex[i];
+		}
+		if (state.ps_active) {
+			PrepareBindings(state.ps_input_info.stage, bindings.pixel);
+			descriptor_stages[stage_count++] = &bindings.pixel;
+		}
+		stages = std::span {descriptor_stages.data(), stage_count};
+		PrepareGraphicsBindings(stages, std::span {m_targets.colors, m_targets.color_count});
 	}
-	if (state.ps_active) {
-		PrepareBindings(state.ps_input_info.stage, bindings.pixel);
-		descriptor_stages[stage_count++] = &bindings.pixel;
-	}
-	const auto stages = std::span {descriptor_stages.data(), stage_count};
-	PrepareGraphicsBindings(stages, std::span {m_targets.colors, m_targets.color_count});
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	vk::DeviceAddress     mesh_indices = 0;
 	if (!mesh_active) {
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::VertexBuffers);
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	} else if (draw.indexed) {
@@ -1129,10 +1203,19 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
 		EXIT_IF((args_buffer.second & 3u) != 0);
 	}
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, m_targets);
+	PipelineCache::Pipeline* pipeline_ptr = nullptr;
+	{
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Pipeline);
+		pipeline_ptr = &m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, m_targets);
+	}
+	auto&                pipeline = *pipeline_ptr;
 	vk::ImageAspectFlags feedback_aspects;
-	const auto rendering = AcquireRenderTargets(buffer, m_targets.colors, m_targets.color_count,
-	                                            m_targets.depth, feedback_aspects, stages);
+	RenderState          rendering;
+	{
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::RenderTargets);
+		rendering = AcquireRenderTargets(buffer, m_targets.colors, m_targets.color_count,
+		                                 m_targets.depth, feedback_aspects, stages);
+	}
 	vk::DeviceAddress task_params = 0;
 	if (mesh_task) {
 		const MeshTaskParams params {
@@ -1158,7 +1241,10 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
 	}
-	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	{
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::CommitBindings);
+		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	}
 	if (!mesh_active) {
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
@@ -1190,10 +1276,13 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	}
 
 	auto& dynamic_state = m_context.GetCommandScheduler().GetDynamicState();
-	UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), m_targets.depth,
-	                           rendering);
-	dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
-	dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
+	{
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::DynamicState);
+		UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), m_targets.depth,
+		                           rendering);
+		dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
+		dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
+	}
 
 	vk::PipelineStageFlags shader_write_stages = {};
 	for (const auto& stage: vertex_stages) {
@@ -1209,24 +1298,27 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		buffer.EndRendering();
 		ShaderWriteHazardBarrier(vk_buffer, shader_write_stages);
 	}
-	buffer.BeginRendering(rendering);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
-	auto&         occlusion_queries = m_context.GetOcclusionQueries();
-	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
-	if (mesh_task) {
-		vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
-	} else if (mesh_active) {
-		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
-	} else if (args_buffer.first == nullptr) {
-		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
-	} else if (draw.indexed) {
-		vk_buffer.drawIndexedIndirect(args_buffer.first->Handle(), args_buffer.second,
-		                              emit.indirect.count, emit.indirect.stride);
-	} else {
-		vk_buffer.drawIndirect(args_buffer.first->Handle(), args_buffer.second,
-		                       emit.indirect.count, emit.indirect.stride);
+	{
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::DrawCall);
+		buffer.BeginRendering(rendering);
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+		auto&         occlusion_queries = m_context.GetOcclusionQueries();
+		const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
+		if (mesh_task) {
+			vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
+		} else if (mesh_active) {
+			vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+		} else if (args_buffer.first == nullptr) {
+			EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+		} else if (draw.indexed) {
+			vk_buffer.drawIndexedIndirect(args_buffer.first->Handle(), args_buffer.second,
+			                              emit.indirect.count, emit.indirect.stride);
+		} else {
+			vk_buffer.drawIndirect(args_buffer.first->Handle(), args_buffer.second,
+			                       emit.indirect.count, emit.indirect.stride);
+		}
+		occlusion_queries.End(vk_buffer, occlusion_query);
 	}
-	occlusion_queries.End(vk_buffer, occlusion_query);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
 
@@ -1234,6 +1326,11 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		buffer.EndRendering();
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
 	}
+	{
+		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Flush);
+		m_context.GetCommandScheduler().FlushForOverlap();
+	}
+	Common::PerfProbe::Tick();
 }
 
 // Vulkan offsets for a prepared draw, or nullopt when its indirect records need the CPU:
@@ -1272,6 +1369,8 @@ static std::optional<DrawEmitInfo> ResolveDrawEmit(const HW::UserConfig&        
 
 bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::DrawIndexTotal);
+	Common::PerfProbe::Span  prefix(Common::PerfProbe::Slot::DrawPrefix);
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
@@ -1290,6 +1389,12 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
+		return true;
+	}
+
+	// Skip depth-only passes before the per-draw setup, not just before the program work.
+	if (SkipDepthOnlyEnabled() && IsDepthOnlyDraw(buffer)) {
+		Common::PerfProbe::Add(Common::PerfProbe::Slot::DepthOnlyDraw, 0);
 		return true;
 	}
 
@@ -1345,6 +1450,7 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 	}
 
 	const DrawCallInfo draw {true, args.index_count, args.instance_count};
+	prefix.Stop();
 	if (!PrepareDrawRenderState(buffer, draw, state)) {
 		ResetBindings();
 		return true;
@@ -1363,6 +1469,7 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::DrawIndexTotal);
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
@@ -1381,6 +1488,12 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
+		return true;
+	}
+
+	// Skip depth-only passes before the per-draw setup, not just before the program work.
+	if (SkipDepthOnlyEnabled() && IsDepthOnlyDraw(buffer)) {
+		Common::PerfProbe::Add(Common::PerfProbe::Slot::DepthOnlyDraw, 0);
 		return true;
 	}
 

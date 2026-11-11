@@ -31,6 +31,20 @@ struct PreparedBindings {
 		uint64_t address = 0;
 		uint64_t size    = 0;
 		BufferId id;
+
+		[[nodiscard]] bool operator==(const BufferSource& other) const noexcept {
+			return address == other.address && size == other.size && id == other.id;
+		}
+	};
+
+	// Descriptor-buffer block of the last RebindBuffers call, per descriptor index. A slot is
+	// reused while its guest range resolves to the same host buffer and no CPU write landed
+	// since the previous upload; MemoryTracker clears the dirty bits after each upload.
+	struct RebindEntry {
+		BufferSource                          source;
+		vk::DescriptorBufferInfo              info {nullptr, 0, VK_WHOLE_SIZE};
+		uint32_t                              shader_size = 0;
+		bool                                  valid       = false;
 	};
 
 	// The draw owns the immutable compiled-program/runtime-snapshot association through commit.
@@ -39,6 +53,7 @@ struct PreparedBindings {
 	// become stale and need resolving again when bindings are rebound.
 	std::vector<BufferSource>             buffer_sources;
 	std::vector<vk::DescriptorBufferInfo> buffers;
+	std::vector<RebindEntry>              rebind_cache;
 	std::vector<TextureBinding>           images;
 	std::vector<vk::Sampler>              samplers;
 	vk::DescriptorBufferInfo              gds {nullptr, 0, VK_WHOLE_SIZE};
