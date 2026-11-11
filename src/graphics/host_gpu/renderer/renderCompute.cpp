@@ -393,6 +393,9 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::DispatchCommit);
 		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 		               std::span {&descriptor_stage, 1u});
+		if (program.has_address_writes) {
+			m_context.GetBufferCache().SupersedeAllPublishes();
+		}
 		if (HasStorageWrites(input_info, bindings)) {
 			Common::PerfProbe::Scope barrier(Common::PerfProbe::Slot::DispatchBarrier);
 			// A host fence used to serialize every dispatch. Preserve its read-before-write
@@ -544,6 +547,9 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	const auto vk_buffer = buffer.Handle();
+	if (program.has_address_writes) {
+		m_context.GetBufferCache().SupersedeAllPublishes();
+	}
 	if (HasStorageWrites(input_info, bindings)) {
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}

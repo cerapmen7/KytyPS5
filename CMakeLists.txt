@@ -794,6 +794,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
 	add_test(NAME hot_readback_table
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --hot-readback-only)
+	add_test(NAME buffer_cache_hot_publish
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-hot-publish-only)
 	add_test(NAME color_render_target_1d
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --rt1d-only)
 
