@@ -207,6 +207,12 @@ void CommandScheduler::Wait(uint64_t tick) {
 }
 
 void CommandScheduler::PopPendingOperations() {
+	// Fast path: the per-draw callers must not pay a semaphore refresh plus the operation
+	// mutex when nothing is deferred, which is the common case (a deferred operation sets
+	// the flag under the same mutex this function drains under).
+	if (!m_has_pending_operations.load(std::memory_order_acquire)) {
+		return;
+	}
 	m_master.Refresh();
 	for (;;) {
 		PendingOperation operation;
@@ -214,10 +220,14 @@ void CommandScheduler::PopPendingOperations() {
 			std::lock_guard lock(m_operation_mutex);
 			if (m_pending_operations.empty() ||
 			    !m_master.IsFree(m_pending_operations.front().tick)) {
+				m_has_pending_operations.store(!m_pending_operations.empty(),
+				                               std::memory_order_release);
 				return;
 			}
 			operation = std::move(m_pending_operations.front());
 			m_pending_operations.pop();
+			m_has_pending_operations.store(!m_pending_operations.empty(),
+			                               std::memory_order_release);
 		}
 		WaitPriorityOperations(operation.tick);
 		RunOperation(std::move(operation.callback));
@@ -239,6 +249,9 @@ void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, 
 	if (m_operation_state == OperationState::Open) {
 		auto& queue = priority ? m_priority_operations : m_pending_operations;
 		queue.push({std::move(operation), CurrentTick()});
+		if (!priority) {
+			m_has_pending_operations.store(true, std::memory_order_release);
+		}
 		lock.unlock();
 		if (priority) {
 			m_operation_available.notify_one();

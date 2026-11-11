@@ -84,15 +84,24 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 }
 
 void GuestGpu::ProcessCommands() {
-	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
-		Common::UniqueFunction<void> command;
-		{
-			Common::LockGuard lock(m_queue_mutex);
-			EXIT_IF(m_commands.empty());
-			command = std::move(m_commands.front());
-			m_commands.pop_front();
-			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
-		}
+	if (m_pending_commands.load(std::memory_order_acquire) == 0) {
+		return;
+	}
+	// Drain the queue with a single lock acquisition and run the commands outside the lock,
+	// so a burst of posted commands (readbacks, deletes) costs one critical section instead
+	// of one per command. Order is preserved; commands posted while the batch runs are picked
+	// up by the next call, exactly like the one-at-a-time loop did.
+	std::deque<Common::UniqueFunction<void>> batch;
+	{
+		Common::LockGuard lock(m_queue_mutex);
+		batch.swap(m_commands);
+	}
+	if (batch.empty()) {
+		return;
+	}
+	m_pending_commands.fetch_sub(batch.size(), std::memory_order_acq_rel);
+	for (auto& command: batch) {
+		EXIT_IF(!command);
 		command();
 	}
 }
@@ -561,11 +570,21 @@ void CommandProcessor::SuspendPm4() {
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Pm4);
 	const bool debug_dump = graphics_debug_dump_enabled();
+	// The pending-commands counter lives on a cache line the guest threads keep dirtying;
+	// reading it per packet costs a cross-core transfer. Checking every 64 packets keeps the
+	// interleave granularity far below a packet batch while cutting those loads ~98%.
+	constexpr uint32_t kPendingCheckMask = 63u;
+	uint32_t           packets_until_pending_check = 0;
+	bool               made_progress               = false;
 	while (!execution.m_buffer_stack.empty()) {
-		if (g_gpu_state != nullptr && g_gpu_state->HasPendingCommands()) {
-			Common::PerfProbe::Scope pending(Common::PerfProbe::Slot::PendingOps);
-			g_gpu_state->ProcessCommands();
+		if (packets_until_pending_check == 0) {
+			packets_until_pending_check = kPendingCheckMask;
+			if (g_gpu_state != nullptr && g_gpu_state->HasPendingCommands()) {
+				Common::PerfProbe::Scope pending(Common::PerfProbe::Slot::PendingOps);
+				g_gpu_state->ProcessCommands();
+			}
 		}
+		--packets_until_pending_check;
 		auto& cursor = execution.m_buffer_stack.back();
 		if (cursor.offset_dw == cursor.commands.size()) {
 			execution.m_buffer_stack.pop_back();
@@ -577,19 +596,19 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		const auto        remaining_dw  = total_dw - cursor.offset_dw;
 		const auto        packet_header = packet[0];
 		const auto        opcode        = (packet_header >> 8u) & 0xffu;
+		const auto        header_len_dw = KYTY_PM4_LEN(packet_header);
 
 		// Zero-code NOP fillers carry no state; skip them without a handler call.
 		if (opcode == Pm4::IT_NOP && KYTY_PM4_R(packet_header) == Pm4::R_ZERO) {
-			const auto packet_dw = KYTY_PM4_LEN(packet_header);
-			EXIT_NOT_IMPLEMENTED(packet_dw == 0 || packet_dw > remaining_dw);
-			cursor.offset_dw += packet_dw;
-			execution.m_made_progress = true;
+			EXIT_NOT_IMPLEMENTED(header_len_dw == 0 || header_len_dw > remaining_dw);
+			cursor.offset_dw += header_len_dw;
+			made_progress = true;
 			continue;
 		}
 
 		if (packet_header == 0x80000000u || Pm4::PacketSizeDw(packet_header) == 1u) {
 			cursor.offset_dw++;
-			execution.m_made_progress = true;
+			made_progress = true;
 			continue;
 		}
 
@@ -598,14 +617,13 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		if (debug_dump) {
 			LOGF("CP packet: offset=0x%05" PRIx32 " cmd_id=0x%08" PRIx32 " op=0x%02" PRIx32
 			     " len=%" PRIu32 "\n",
-			     cursor.offset_dw, packet_header, opcode, KYTY_PM4_LEN(packet_header));
+			     cursor.offset_dw, packet_header, opcode, header_len_dw);
 		}
 
 		if ((packet_header & 1u) != 0 && ShouldSkipPredicatedPackets()) {
-			auto packet_dw = KYTY_PM4_LEN(packet_header);
-			EXIT_NOT_IMPLEMENTED(packet_dw > remaining_dw);
-			cursor.offset_dw += packet_dw;
-			execution.m_made_progress = true;
+			EXIT_NOT_IMPLEMENTED(header_len_dw > remaining_dw);
+			cursor.offset_dw += header_len_dw;
+			made_progress = true;
 			continue;
 		}
 
@@ -629,11 +647,12 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		EXIT_IF(packet_dw > remaining_dw);
+		made_progress = true;
 		if (execution.m_suspended) {
+			execution.m_made_progress = made_progress;
 			return;
 		}
 		cursor.offset_dw += packet_dw;
-		execution.m_made_progress = true;
 		if (!execution.m_next_buffer.empty()) {
 			// Chains and taken branches reuse the fetcher; only calls retain a return cursor.
 			if (execution.m_chain) {
@@ -644,6 +663,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			execution.m_next_buffer = {};
 		}
 	}
+	execution.m_made_progress = made_progress;
 }
 
 void CommandProcessor::SetIndexType(uint32_t index_type_and_size) {

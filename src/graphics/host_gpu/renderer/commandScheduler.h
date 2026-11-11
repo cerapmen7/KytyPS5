@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <queue>
@@ -96,6 +97,9 @@ private:
 	DynamicState                 m_dynamic_state;
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;
+	// Mirrors !m_pending_operations.empty() so the per-draw PopPendingOperations can skip
+	// the semaphore refresh and the mutex when nothing is deferred (the common case).
+	std::atomic<bool>            m_has_pending_operations {false};
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;
 	std::jthread                 m_priority_thread;

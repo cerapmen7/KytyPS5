@@ -678,6 +678,13 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
 	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Sync);
+	// Fast path: most of the thousands of read-only obtains per frame have nothing to upload.
+	// One lock-free tracker query is far cheaper than the create-on-miss region walk plus the
+	// upload machinery. Written obtains must still run to mark the range GPU-dirty, and texel
+	// buffers need the image synchronization check.
+	if (!is_written && !is_texel_buffer && !m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+		return false;
+	}
 	// ObtainBuffer reaches this path thousands of times per frame; a scratch vector per call
 	// showed up as allocator traffic on the GPU thread.
 	static thread_local std::vector<vk::BufferCopy> copies;
@@ -725,10 +732,11 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
                                      uint64_t total_size) {
-	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Upload);
 	if (copies.empty()) {
 		return nullptr;
 	}
+	// After the early-out: the empty case is the common one (~2800 calls per frame).
+	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Upload);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, total_size);
 
 	const auto source = UploadMemory(m_graphics, m_scheduler, m_staging_buffer, total_size, 4,

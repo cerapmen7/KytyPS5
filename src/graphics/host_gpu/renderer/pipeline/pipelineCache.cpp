@@ -891,30 +891,43 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 
 const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                      ShaderComputeInputInfo&      input_info) {
-	// Compute dispatches repeat the same shader with different workgroup counts. Reuse the
-	// previous resolution when every input that selects the module is unchanged.
+	// Compute dispatches repeat the same shader with different workgroup counts. The counts
+	// select the module only when the plan derives a descriptor from them (workgroup_axis
+	// sources on a direct dispatch); an indirect dispatch reads them from guest memory at
+	// indirect_args_address, which is part of the key. Everything else about the resolution
+	// depends on the registers and the mode flags alone, so the counts stay out of the hash
+	// unless the resolved plan actually uses them.
 	struct ComputeInputKey {
 		bool     async_compute;
 		bool     dispatch_thread_dimensions;
 		uint32_t host_subgroup_size;
-		uint32_t workgroup_counts[3];
 		uint64_t indirect_args_address;
 	} key {input_info.async_compute, input_info.dispatch_thread_dimensions,
-	       input_info.host_subgroup_size,
-	       {input_info.workgroup_counts[0], input_info.workgroup_counts[1],
-	        input_info.workgroup_counts[2]},
-	       input_info.indirect_args_address};
+	       input_info.host_subgroup_size, input_info.indirect_args_address};
 	struct ComputeCacheEntry {
 		uint64_t               hash   = 0;
+		uint32_t               counts[3] {};
 		const ShaderModule*    module = nullptr;
 		ShaderComputeInputInfo info {};
-		bool                   valid = false;
+		bool                   counts_dependent = false;
+		bool                   valid            = false;
 	};
-	static thread_local ComputeCacheEntry last {};
+	static thread_local std::array<ComputeCacheEntry, 4> cache {};
+	const uint32_t caller_counts[3] = {input_info.workgroup_counts[0],
+	                                   input_info.workgroup_counts[1],
+	                                   input_info.workgroup_counts[2]};
 	uint64_t hash = XXH3_64bits(&regs, sizeof(regs));
 	hash          = XXH3_64bits_withSeed(&key, sizeof(key), hash);
-	if (last.valid && last.hash == hash) {
-		input_info = last.info;
+	auto&    last = cache[hash & (std::size(cache) - 1)];
+	if (last.valid && last.hash == hash &&
+	    (!last.counts_dependent ||
+	     (last.counts[0] == caller_counts[0] &&
+	      last.counts[1] == caller_counts[1] &&
+	      last.counts[2] == caller_counts[2]))) {
+		input_info                     = last.info;
+		input_info.workgroup_counts[0] = caller_counts[0];
+		input_info.workgroup_counts[1] = caller_counts[1];
+		input_info.workgroup_counts[2] = caller_counts[2];
 		return last.module;
 	}
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
@@ -923,9 +936,28 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
 	uint32_t          push_data_cursor = 0;
 	const auto* module = GetProgram(params, input_info, push_data_cursor);
+	// The plan of the program that was just resolved tells whether a later dispatch with
+	// different counts must re-run the resolution. m_lookup_key still holds its key.
+	bool counts_dependent = false;
+	if (module != nullptr) {
+		if (const auto entry = m_program_cache.find(m_lookup_key);
+		    entry != m_program_cache.end()) {
+			for (const auto& source: entry->second.resource_plan.descriptor_sources) {
+				if (source.indirect_descriptor &&
+				    source.indirect_descriptor->workgroup_axis != UINT32_MAX) {
+					counts_dependent = true;
+					break;
+				}
+			}
+		}
+	}
 	last.hash   = hash;
+	last.counts[0] = input_info.workgroup_counts[0];
+	last.counts[1] = input_info.workgroup_counts[1];
+	last.counts[2] = input_info.workgroup_counts[2];
 	last.module = module;
 	last.info   = input_info;
+	last.counts_dependent = counts_dependent;
 	last.valid  = true;
 	return module;
 }

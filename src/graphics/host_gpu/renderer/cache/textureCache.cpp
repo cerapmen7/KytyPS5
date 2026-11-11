@@ -1076,11 +1076,13 @@ void TextureCache::InitializeImage(ImageId id) {
 
 void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
                                        uint32_t metadata_base_layer) {
-	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::MatClear);
+	// The probe sits after the metadata early-out: this runs ~15k times per frame and
+	// the probe itself would cost more than the rejected calls.
 	if (desc.info.metadata.kind != ImageMetadataKind::Dcc &&
 	    desc.info.metadata.kind != ImageMetadataKind::Cmask) {
 		return;
 	}
+	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::MatClear);
 	const auto  range = desc.info.metadata.range;
 	const auto& view  = desc.view_info;
 	{
