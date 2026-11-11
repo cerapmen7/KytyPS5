@@ -65,7 +65,7 @@ private:
 		vk::CommandBuffer Commit();
 
 	private:
-		static constexpr size_t GrowStep = 4;
+		static constexpr size_t GrowStep = 32;
 
 		size_t Grow();
 

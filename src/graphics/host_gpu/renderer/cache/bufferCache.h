@@ -17,6 +17,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <semaphore>
 #include <span>
 #include <utility>
 #include <vector>
@@ -166,8 +167,14 @@ private:
 	// Collects one unclaimed piece of a recent write when a single buffer holds it and it fits.
 	void CollectRecentPiece(uint64_t address, uint64_t size, uint64_t& budget,
 	                        std::vector<BatchedDownload>& batch);
-	[[nodiscard]] bool DownloadWithHotBuffers(BufferId main_id, Buffer& buffer, uint64_t vaddr,
-	                                          uint64_t size);
+	[[nodiscard]] bool RecordHotDownloadBatch(BufferId main_id, Buffer& buffer, uint64_t vaddr,
+	                                          uint64_t size, std::vector<BatchedDownload>& batch);
+	// ReadMemory's GPU-thread stage: records the downloads and schedules the publish on the
+	// priority thread. `done` is released once the bytes are in guest RAM and the tracker
+	// fixups ran; `caller_is_gpu` runs those fixups inline instead of posting them, because
+	// a GPU-thread caller blocks on `done` and would never process the post.
+	void ReadMemoryOnGpuThread(uint64_t vaddr, uint64_t size, bool is_write, bool caller_is_gpu,
+	                           std::binary_semaphore& done);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
