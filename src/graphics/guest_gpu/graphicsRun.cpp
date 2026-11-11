@@ -179,6 +179,7 @@ CommandProcessor& GuestGpu::GetProcessor(uint32_t queue_id) {
 }
 
 void CommandProcessor::Reset() {
+	InvalidateAllRegisterShadows();
 	m_sh_ctx.Reset();
 	m_ucfg.Reset();
 	m_ctx.Reset();
@@ -194,6 +195,8 @@ void CommandProcessor::Reset() {
 }
 
 void CommandProcessor::ApplyContextStateOperation(ContextStateOperation operation) {
+	// Clear/Pop rewrite the decoded context in bulk; the raw shadows no longer describe it.
+	InvalidateRegisterShadow(RegisterSpace::Cx);
 	switch (operation) {
 		case ContextStateOperation::Clear: m_ctx.Reset(); break;
 		case ContextStateOperation::Push:
@@ -668,6 +671,84 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 void CommandProcessor::SetIndexType(uint32_t index_type_and_size) {
 	m_index_type_and_size = index_type_and_size & 0x3u;
+}
+
+bool CommandProcessor::ConsumeRegisterWrite(RegisterSpace space, uint32_t offset,
+                                            uint32_t value) {
+	uint32_t* values;
+	uint32_t* epochs;
+	uint32_t  gen;
+	switch (space) {
+		case RegisterSpace::Cx:
+			EXIT_IF(offset >= Pm4::CX_NUM);
+			values = m_shadow_cx_value.data();
+			epochs = m_shadow_cx_epoch.data();
+			gen    = m_shadow_cx_gen;
+			break;
+		case RegisterSpace::Sh:
+			EXIT_IF(offset >= Pm4::SH_NUM);
+			// The direct SET_SH_REG handlers write the same storage without keeping a
+			// shadow; an offset they own must always take the handler call so the two
+			// paths cannot disagree about the current value.
+			if (g_hw_sh_func[offset] != nullptr) {
+				return false;
+			}
+			values = m_shadow_sh_value.data();
+			epochs = m_shadow_sh_epoch.data();
+			gen    = m_shadow_sh_gen;
+			break;
+		case RegisterSpace::Uc:
+			EXIT_IF(offset >= Pm4::UC_NUM);
+			// VGT_INDEX_TYPE aliases m_index_type_and_size, which IT_INDEX_TYPE writes
+			// outside the register tables.
+			if (offset == Pm4::VGT_INDEX_TYPE) {
+				return false;
+			}
+			values = m_shadow_uc_value.data();
+			epochs = m_shadow_uc_epoch.data();
+			gen    = m_shadow_uc_gen;
+			break;
+		default:
+			return false;
+	}
+	if (epochs[offset] == gen) {
+		if (values[offset] == value) {
+			return true;
+		}
+	} else {
+		epochs[offset] = gen;
+	}
+	values[offset] = value;
+	return false;
+}
+
+void CommandProcessor::InvalidateRegisterShadow(RegisterSpace space) {
+	switch (space) {
+		case RegisterSpace::Cx:
+			if (++m_shadow_cx_gen == 0) {
+				m_shadow_cx_gen = 1;
+				m_shadow_cx_epoch.fill(0);
+			}
+			break;
+		case RegisterSpace::Sh:
+			if (++m_shadow_sh_gen == 0) {
+				m_shadow_sh_gen = 1;
+				m_shadow_sh_epoch.fill(0);
+			}
+			break;
+		case RegisterSpace::Uc:
+			if (++m_shadow_uc_gen == 0) {
+				m_shadow_uc_gen = 1;
+				m_shadow_uc_epoch.fill(0);
+			}
+			break;
+	}
+}
+
+void CommandProcessor::InvalidateAllRegisterShadows() {
+	InvalidateRegisterShadow(RegisterSpace::Cx);
+	InvalidateRegisterShadow(RegisterSpace::Sh);
+	InvalidateRegisterShadow(RegisterSpace::Uc);
 }
 
 void CommandProcessor::SetIndexBaseAddress(uint64_t index_base_addr) {

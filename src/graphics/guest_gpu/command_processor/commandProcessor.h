@@ -4,10 +4,12 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/pssr.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -75,6 +77,21 @@ public:
 	void SetIndexBufferSize(uint32_t index_buffer_size);
 	void SetDrawIndirectArgsBaseAddress(uint64_t draw_indirect_args_base_addr);
 	void SetDispatchIndirectArgsBaseAddress(uint64_t dispatch_indirect_args_base_addr);
+
+	// PM4 register-write shadows. The guest re-emits identical register values constantly
+	// (Unity writes its full state block per draw), and every table handler is either a pure
+	// decode of (offset, value) or a read-modify-write that preserves the fields owned by
+	// other registers, so a write repeating the last applied raw value cannot change the
+	// decoded state and its handler call can be skipped. Offsets whose storage is also
+	// written outside the shadowed paths (the direct SET_SH_REG handlers, VGT_INDEX_TYPE)
+	// are never shadowed. Bulk rewrites invalidate a space in O(1) through an epoch stamp.
+	enum class RegisterSpace : uint8_t { Cx, Sh, Uc };
+	// Returns true when the write repeats the current shadowed value and may be skipped;
+	// otherwise records the value and returns false (the caller applies the handler).
+	bool ConsumeRegisterWrite(RegisterSpace space, uint32_t offset, uint32_t value);
+	void InvalidateRegisterShadow(RegisterSpace space);
+	void InvalidateAllRegisterShadows();
+
 	[[nodiscard]] uint64_t GetDispatchIndirectArgsBaseAddress() const {
 		return m_dispatch_indirect_args_base_addr;
 	}
@@ -145,6 +162,18 @@ private:
 	uint32_t       m_draws                       = 0; // Since the buffer start or CountDraw's flush
 	uint64_t       m_synthetic_occlusion_counter = 0;
 	bool           m_predicate_skip              = false;
+
+	// Raw-value shadows of the three PM4 register spaces with per-register epoch stamps
+	// (see ConsumeRegisterWrite). ~145 KB; one set per command processor.
+	std::array<uint32_t, Pm4::CX_NUM> m_shadow_cx_value {};
+	std::array<uint32_t, Pm4::CX_NUM> m_shadow_cx_epoch {};
+	std::array<uint32_t, Pm4::SH_NUM> m_shadow_sh_value {};
+	std::array<uint32_t, Pm4::SH_NUM> m_shadow_sh_epoch {};
+	std::array<uint32_t, Pm4::UC_NUM> m_shadow_uc_value {};
+	std::array<uint32_t, Pm4::UC_NUM> m_shadow_uc_epoch {};
+	uint32_t                          m_shadow_cx_gen = 1;
+	uint32_t                          m_shadow_sh_gen = 1;
+	uint32_t                          m_shadow_uc_gen = 1;
 };
 
 } // namespace Libs::Graphics

@@ -1060,6 +1060,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 			EXIT("unknown cx reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
 		}
 
+		if (cp.ConsumeRegisterWrite(CommandProcessor::RegisterSpace::Cx, cmd_offset, value)) {
+			continue;
+		}
 		pfunc(cp, cmd_offset, value);
 	}
 
@@ -1113,6 +1116,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 			EXIT("unknown sh reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
 		}
 
+		if (cp.ConsumeRegisterWrite(CommandProcessor::RegisterSpace::Sh, cmd_offset, value)) {
+			continue;
+		}
 		pfunc(cp, cmd_offset, value);
 	}
 
@@ -1158,6 +1164,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 				     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
 			}
 			EXIT("unknown uc reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
+		}
+		if (cp.ConsumeRegisterWrite(CommandProcessor::RegisterSpace::Uc, cmd_offset, value)) {
+			continue;
 		}
 		pfunc(cp, cmd_offset, value);
 	}
@@ -1248,7 +1257,8 @@ KYTY_CP_OP_PARSER(CpOpMemSemaphore) {
 
 // Writes each value of a SET_*_REG packet to the next register, as the hardware does.
 template <typename Table>
-static uint32_t SetRegisters(CommandProcessor& cp, const Table& table, uint32_t cmd_id,
+static uint32_t SetRegisters(CommandProcessor& cp, const Table& table,
+                             CommandProcessor::RegisterSpace space, uint32_t cmd_id,
                              uint32_t cmd_offset, const uint32_t* values, uint32_t position) {
 	const auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
 	for (uint32_t i = 0; i < num_values; i++) {
@@ -1257,6 +1267,11 @@ static uint32_t SetRegisters(CommandProcessor& cp, const Table& table, uint32_t 
 			EXIT("unknown register\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32
 			     "\n\tcmd_offset = %08" PRIx32 "\n",
 			     position, cmd_id, offset);
+		}
+		// Identical rewrites of a register cannot change the decoded state (every handler
+		// is a pure decode or a field-preserving merge); skip the indirect call.
+		if (cp.ConsumeRegisterWrite(space, offset, values[i])) {
+			continue;
 		}
 		table[offset](cp, offset, values[i]);
 	}
@@ -1272,7 +1287,8 @@ KYTY_CP_OP_PARSER(CpOpSetContextReg) {
 		return 2;
 	}
 
-	return SetRegisters(cp, g_hw_ctx_indirect_func, cmd_id, cmd_offset, buffer + 1, num_dw - dw);
+	return SetRegisters(cp, g_hw_ctx_indirect_func, CommandProcessor::RegisterSpace::Cx, cmd_id,
+	                    cmd_offset, buffer + 1, num_dw - dw);
 }
 
 KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
@@ -1288,7 +1304,8 @@ KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
 	auto pfunc = g_hw_sh_func[cmd_offset];
 
 	if (pfunc == nullptr) {
-		return SetRegisters(cp, g_hw_sh_indirect_func, cmd_id, cmd_offset, buffer + 1, num_dw - dw);
+		return SetRegisters(cp, g_hw_sh_indirect_func, CommandProcessor::RegisterSpace::Sh, cmd_id,
+		                    cmd_offset, buffer + 1, num_dw - dw);
 	}
 
 	auto s = pfunc(cp, cmd_id, cmd_offset, buffer + 1, dw);
@@ -1314,7 +1331,8 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 		return KYTY_PM4_LEN(cmd_id) - 1u;
 	}
 
-	return SetRegisters(cp, g_hw_uc_indirect_func, cmd_id, cmd_offset, buffer + 1, num_dw - dw);
+	return SetRegisters(cp, g_hw_uc_indirect_func, CommandProcessor::RegisterSpace::Uc, cmd_id,
+	                    cmd_offset, buffer + 1, num_dw - dw);
 }
 
 KYTY_CP_OP_PARSER(CpOpWaitFlipDone) {
