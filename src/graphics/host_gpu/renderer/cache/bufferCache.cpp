@@ -428,17 +428,17 @@ void BufferCache::CollectRecentPiece(uint64_t address, uint64_t size, uint64_t& 
 	batch.push_back({&buffer, std::move(pending), address, size});
 }
 
-/// Records the download of the main window together with the GPU-written bytes of hot buffers
-/// and the finished recent small writes, so one GPU wait covers the whole batch. The extras are
-/// filled with the range to unmark once published; the caller submits the work, waits and
-/// publishes. Nothing is marked CPU-modified, since only a faulting write does that. Returns
+/// Downloads the main window, the GPU-written bytes of hot buffers and the finished recent small
+/// writes with one GPU wait. The extras are marked clean here, and the caller does that for the
+/// main window. Nothing is marked CPU-modified, since only a faulting write does that. Returns
 /// false when the window had nothing.
-bool BufferCache::RecordHotDownloadBatch(BufferId main_id, Buffer& buffer, uint64_t vaddr,
-                                         uint64_t size, std::vector<BatchedDownload>& batch) {
+bool BufferCache::DownloadWithHotBuffers(BufferId main_id, Buffer& buffer, uint64_t vaddr,
+                                         uint64_t size) {
 	auto main_pending = CollectDownloadCopies(buffer, vaddr, size);
 	if (main_pending.copies.empty()) {
 		return false;
 	}
+	std::vector<BatchedDownload> batch;
 	batch.reserve(MaxHotReadbackEntries + 1);
 	batch.push_back({&buffer, std::move(main_pending)});
 	uint64_t budget = MaxHotReadbackBytes;
@@ -454,6 +454,19 @@ bool BufferCache::RecordHotDownloadBatch(BufferId main_id, Buffer& buffer, uint6
 	ReserveDownloadMemory(pendings);
 	for (const auto& item: batch) {
 		RecordDownload(*item.buffer, item.pending);
+	}
+	const auto tick = m_scheduler.CurrentTick();
+	{
+		Common::PerfProbe::Scope wait(Common::PerfProbe::Slot::WaitDownload);
+		m_scheduler.Wait(tick);
+	}
+	m_scheduler.WaitPriorityOperations(tick);
+	for (const auto& item: batch) {
+		PublishDownload(item.pending);
+	}
+	for (size_t index = 1; index < batch.size(); ++index) {
+		m_memory_tracker.UnmarkRegionAsGpuModified(batch[index].unmark_address,
+		                                           batch[index].unmark_size);
 	}
 	return true;
 }
@@ -533,93 +546,31 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	// Only the requesting thread blocks here. The GPU thread records the download copies and
-	// keeps processing commands; the priority thread publishes the bytes once the GPU finished
-	// the copies, and the tracker fixups return to the GPU thread so every tracker mutation
-	// stays ordered against command processing. Blocking the GPU thread on the drain instead
-	// cost ~4 ms per frame on readback-heavy games.
-	const bool          caller_is_gpu = GuestGpu::IsGpuThread();
-	std::binary_semaphore done {0};
-	m_scheduler.Context().GetGpu().SendCommand([this, vaddr, size, is_write, caller_is_gpu, &done] {
-		ReadMemoryOnGpuThread(vaddr, size, is_write, caller_is_gpu, done);
-	});
-	done.acquire();
-}
-
-void BufferCache::ReadMemoryOnGpuThread(uint64_t vaddr, uint64_t size, bool is_write,
-                                        bool caller_is_gpu, std::binary_semaphore& done) {
-	if (is_write && !IsRegionRegistered(vaddr, size)) {
-		done.release();
-		return;
-	}
-	const auto buffer_id = FindBuffer(vaddr, size);
-	auto&      buffer    = m_slot_buffers[buffer_id];
-	if (IsRegionGpuModified(vaddr, size)) {
-		const auto start =
-		    std::max(Common::AlignDown(vaddr, DownloadWindowSize), buffer.CpuAddress());
-		const auto end = std::min(std::max(start + DownloadWindowSize, vaddr + size),
-		                          buffer.CpuAddress() + buffer.Size());
-		std::vector<BatchedDownload> batch;
-		bool                         recorded;
-		if (m_batch_hot_readbacks) {
-			recorded = RecordHotDownloadBatch(buffer_id, buffer, start, end - start, batch);
-		} else {
-			auto pending = CollectDownloadCopies(buffer, start, end - start);
-			recorded     = !pending.copies.empty();
-			if (recorded) {
-				batch.push_back({&buffer, std::move(pending)});
-				PendingDownload* const items[] = {&batch[0].pending};
-				ReserveDownloadMemory(items);
-				RecordDownload(buffer, batch[0].pending);
-			}
-		}
-		if (recorded) {
-			const auto buffer_address = buffer.CpuAddress();
-			const auto buffer_size    = buffer.Size();
-			const auto main_size      = end - start;
-			auto&      gpu            = m_scheduler.Context().GetGpu();
-			// Queued before the flush so the operation is stamped with the tick of the
-			// command buffer that carries the copies; the flush submits exactly that buffer.
-			m_scheduler.DeferPriorityOperation(
-			    [this, batch = std::move(batch), &gpu, &done, caller_is_gpu, buffer_address,
-			     buffer_size, start, main_size, vaddr, size, is_write] mutable {
-				    for (const auto& item: batch) {
-					    PublishDownload(item.pending);
-				    }
-				    // The bytes are in guest RAM now. The tracker fixups must run on the
-				    // GPU thread so no concurrent command processing can interleave with
-				    // them; a GPU-thread caller blocks on `done` and cannot process a
-				    // post, and during shutdown no post would run at all, so both run
-				    // the fixups inline (the GPU thread is provably idle in both cases).
-				    auto fixups = [this, batch = std::move(batch), buffer_address, buffer_size,
-				                   start, main_size, vaddr, size, is_write, &done] {
-					    m_memory_tracker.UnmarkRegionAsGpuModified(start, main_size);
-					    for (size_t index = 1; index < batch.size(); ++index) {
-						    m_memory_tracker.UnmarkRegionAsGpuModified(
-						        batch[index].unmark_address, batch[index].unmark_size);
-					    }
-					    NoteHotReadback(buffer_address, buffer_size);
-					    if (is_write) {
-						    m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
-						    QueueBdaSync(vaddr, size);
-					    }
-					    done.release();
-				    };
-				    if (caller_is_gpu || gpu.IsStopping()) {
-					    fixups();
-				    } else {
-					    gpu.SendCommand(std::move(fixups));
-				    }
-			    });
-			m_scheduler.Flush();
+	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
+		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
-	}
-	if (is_write) {
-		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
-		QueueBdaSync(vaddr, size);
-	}
-	done.release();
+		const auto buffer_id = FindBuffer(vaddr, size);
+		auto&      buffer    = m_slot_buffers[buffer_id];
+		if (IsRegionGpuModified(vaddr, size)) {
+			const auto start =
+			    std::max(Common::AlignDown(vaddr, DownloadWindowSize), buffer.CpuAddress());
+			const auto end = std::min(std::max(start + DownloadWindowSize, vaddr + size),
+			                          buffer.CpuAddress() + buffer.Size());
+			const bool downloaded =
+			    m_batch_hot_readbacks
+			        ? DownloadWithHotBuffers(buffer_id, buffer, start, end - start)
+			        : DownloadBufferMemory<false>(buffer, start, end - start);
+			if (downloaded) {
+				m_memory_tracker.UnmarkRegionAsGpuModified(start, end - start);
+				NoteHotReadback(buffer.CpuAddress(), buffer.Size());
+			}
+		}
+		if (is_write) {
+			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+			QueueBdaSync(vaddr, size);
+		}
+	});
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
