@@ -848,6 +848,17 @@ static bool SkipDepthOnlyEnabled() {
 	return enabled;
 }
 
+// Opt-in companion: KYTY_SKIP_DEPTH_EARLY=1 decides the depth-only skip before the per-draw
+// metadata resolution and the executor lock. The later check stays in place, so a draw that
+// survives this one is still skipped where it was before.
+static bool EarlyDepthSkipEnabled() {
+	static const bool enabled = [] {
+		const auto* const value = std::getenv("KYTY_SKIP_DEPTH_EARLY");
+		return value != nullptr && *value != '\0' && std::strtoul(value, nullptr, 10) != 0;
+	}();
+	return enabled;
+}
+
 // Mirrors the colour-output mask PipelineCache::GetGraphicsPrograms derives from the shader
 // registers, so a pass that exports no colour is recognised before any program work.
 static uint32_t RegisterColorOutputMask(const HW::Context& context) {
@@ -1379,6 +1390,12 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 	Common::PerfProbe::Span  prefix(Common::PerfProbe::Slot::DrawPrefix);
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
+	// The shadow cascades submit thousands of depth-only draws per frame. Deciding the skip here
+	// keeps the lock, the metadata checks and the vertex-shader validity test off their path.
+	if (EarlyDepthSkipEnabled() && IsDepthOnlyDraw(buffer)) {
+		Common::PerfProbe::Add(Common::PerfProbe::Slot::DepthOnlyDraw, 0);
+		return true;
+	}
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
@@ -1478,6 +1495,11 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::DrawIndexTotal);
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
+	// As in DrawIndex: the depth-only skip is decided before the lock and the metadata work.
+	if (EarlyDepthSkipEnabled() && IsDepthOnlyDraw(buffer)) {
+		Common::PerfProbe::Add(Common::PerfProbe::Slot::DepthOnlyDraw, 0);
+		return true;
+	}
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
