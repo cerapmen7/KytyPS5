@@ -420,6 +420,13 @@ void GuestGpu::ThreadRun(void* data) {
 	if (!Common::Thread::SetCurrentPriorityHighest()) {
 		LOGF("GPU: could not raise the GPU thread priority\n");
 	}
+	// Lab experiment: make the bottleneck thread time-critical so guest threads cannot preempt it.
+	if (const auto* priority = std::getenv("KYTY_GPU_PRIORITY");
+	    priority != nullptr && *priority != '\0' && std::strtoul(priority, nullptr, 10) != 0) {
+		if (!Common::Thread::SetCurrentPriorityTimeCritical()) {
+			LOGF("GPU: could not set the GPU thread time-critical\n");
+		}
+	}
 	// Lab experiment: pin the GPU thread away from the cores the guest threads use most. The
 	// mask is a hex or decimal processor mask, e.g. 4 for CPU 2. Off when unset.
 	if (const auto* affinity = std::getenv("KYTY_GPU_AFFINITY");

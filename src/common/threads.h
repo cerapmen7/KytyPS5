@@ -25,6 +25,9 @@ int GetThreadIdUnique();
 // Windows only. Sets the calling thread to THREAD_PRIORITY_HIGHEST so busy guest threads do not
 // take its core. Returns false when the host refuses.
 bool SetCurrentPriorityHighest();
+// Windows only. THREAD_PRIORITY_TIME_CRITICAL for the one bottleneck thread. Returns false when
+// the host refuses.
+bool SetCurrentPriorityTimeCritical();
 // Windows only. Pins the calling thread to the processor mask (bit 0 = CPU 0). Returns false when
 // the host refuses or the mask has no processors in this process.
 bool SetCurrentAffinity(uint64_t mask);

@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/perfProbe.h"
+#include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
@@ -304,6 +305,13 @@ bool CommandScheduler::HasPendingPriorityOperations() {
 }
 
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Lab experiment: keep the readback/deferred runner off the core pinned to the GPU thread.
+	if (const auto* affinity = std::getenv("KYTY_AUX_AFFINITY");
+	    affinity != nullptr && *affinity != '\0') {
+		(void)Common::Thread::SetCurrentAffinity(std::strtoull(affinity, nullptr, 0));
+	}
+#endif
 	while (!stop.stop_requested()) {
 		PendingOperation operation;
 		{
