@@ -30,14 +30,23 @@ namespace {
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
 // GPU-modified ranges come as many small scattered islands, so a readback widens to a window.
-constexpr uint64_t DownloadWindowSize = 512 * 1024;
+// All four can be tuned for lab A/B without a rebuild.
+template <typename T>
+T LabEnv(const char* name, T fallback) {
+	const auto* const value = std::getenv(name);
+	if (value == nullptr || *value == '\0') {
+		return fallback;
+	}
+	return static_cast<T>(std::strtoull(value, nullptr, 10));
+}
+constexpr uint64_t DefaultDownloadWindowSize = 512 * 1024;
 // Packed download ranges start on their own cache line, as in shadPS4.
 constexpr uint64_t DownloadCopyAlignment = 64;
 
-constexpr uint64_t HotFlips      = 8;
-constexpr size_t   HotPagesMax   = 1024;
-constexpr uint64_t HotNotePages  = 16;
-constexpr uint64_t PublishBudget = 1 * MiB;
+constexpr uint64_t DefaultHotFlips      = 8;
+constexpr size_t   DefaultHotPagesMax   = 1024;
+constexpr uint64_t HotNotePages         = 16;
+constexpr uint64_t DefaultPublishBudget = 1 * MiB;
 
 void RecordDownloadCopies(vk::CommandBuffer native, const Buffer& source, const Buffer& target,
                           std::span<const vk::BufferCopy> copies, uint64_t offset, uint64_t size) {
@@ -573,9 +582,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		const auto buffer_id = FindBuffer(vaddr, size);
 		auto&      buffer    = m_slot_buffers[buffer_id];
 		if (IsRegionGpuModified(vaddr, size)) {
+			static const uint64_t download_window =
+			    LabEnv("KYTY_DOWNLOAD_WINDOW", DefaultDownloadWindowSize);
 			const auto start =
-			    std::max(Common::AlignDown(vaddr, DownloadWindowSize), buffer.CpuAddress());
-			const auto end = std::min(std::max(start + DownloadWindowSize, vaddr + size),
+			    std::max(Common::AlignDown(vaddr, download_window), buffer.CpuAddress());
+			const auto end = std::min(std::max(start + download_window, vaddr + size),
 			                          buffer.CpuAddress() + buffer.Size());
 			const bool downloaded =
 			    m_batch_hot_readbacks
@@ -603,7 +614,7 @@ void BufferCache::NoteReadHot(uint64_t vaddr, uint64_t size) {
 	for (auto page = first; page < last; page += TRACKER_PAGE_SIZE) {
 		if (auto it = m_hot_pages.find(page); it != m_hot_pages.end()) {
 			it->second = m_hot_flip;
-		} else if (m_hot_pages.size() < HotPagesMax) {
+		} else if (m_hot_pages.size() < LabEnv("KYTY_HOT_PAGES", DefaultHotPagesMax)) {
 			m_hot_pages.emplace(page, m_hot_flip);
 			m_hot_ranges.Add(page, TRACKER_PAGE_SIZE);
 		}
@@ -612,8 +623,9 @@ void BufferCache::NoteReadHot(uint64_t vaddr, uint64_t size) {
 
 void BufferCache::DecayReadHot() {
 	m_hot_flip++;
-	std::erase_if(m_hot_pages, [this](const auto& page) {
-		if (m_hot_flip - page.second <= HotFlips) {
+	const auto hot_flips = LabEnv("KYTY_HOT_FLIPS", DefaultHotFlips);
+	std::erase_if(m_hot_pages, [this, hot_flips](const auto& page) {
+		if (m_hot_flip - page.second <= hot_flips) {
 			return false;
 		}
 		m_hot_ranges.Subtract(page.first, TRACKER_PAGE_SIZE);
@@ -666,7 +678,7 @@ void BufferCache::PublishReadHot() {
 		m_gpu_modified_ranges.ForEachInRange(
 		    start, end - start, [&](uint64_t first, uint64_t last) {
 			    const auto bytes = last - first;
-			    if (total + bytes > PublishBudget) {
+			    if (total + bytes > LabEnv("KYTY_PUBLISH_BUDGET", DefaultPublishBudget)) {
 				    retained.Add(first, bytes);
 				    return;
 			    }

@@ -33,6 +33,10 @@ public:
 	// Submit completed draws periodically so the GPU can start executing the frame before the
 	// whole command stream has been recorded. KYTY_OVERLAP_DRAWS sets the interval (0 disables).
 	void           FlushForOverlap();
+	// Like Flush, but can defer the submit across KYTY_COALESCE_FLUSH end-of-slice flushes so the
+	// CPU does not pay one vkQueueSubmit per guest submission. A Wait/Finish/frame boundary still
+	// submits everything recorded so far.
+	void           FlushCoalesced();
 	void           Finish();
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
@@ -132,6 +136,7 @@ private:
 	uint32_t                     m_overlap_draws        = 0;
 	OperationState               m_operation_state      = OperationState::Open;
 	SubmitCadence                m_cadence;
+	uint32_t                     m_coalesced_flushes = 0;
 };
 
 } // namespace Libs::Graphics

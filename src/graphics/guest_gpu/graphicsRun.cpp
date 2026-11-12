@@ -223,7 +223,7 @@ void CommandProcessor::BufferInit() {
 
 void CommandProcessor::BufferFlush() {
 	m_renderer.GetBufferCache().PublishReadHot();
-	GetScheduler().Flush();
+	GetScheduler().FlushCoalesced();
 	// The occlusion counters reach a guest that polls them without waiting for a later fence.
 	m_renderer.GetOcclusionQueries().Publish();
 }

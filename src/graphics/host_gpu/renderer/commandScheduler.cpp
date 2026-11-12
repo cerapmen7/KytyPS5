@@ -172,6 +172,29 @@ void CommandScheduler::FlushForOverlap() {
 	Flush();
 }
 
+void CommandScheduler::FlushCoalesced() {
+	// The guest ends every submission slice with a flush. Submitting each one costs a
+	// vkQueueSubmit (~25 us on the lab machine) and the GPU is not the bottleneck in the
+	// depth-skipped mode, so record up to KYTY_COALESCE_FLUSH slices into one command buffer.
+	// Any Wait/Finish/frame boundary submits the accumulated work anyway, so progress is kept.
+	static const uint32_t interval = [] {
+		const auto* const value = std::getenv("KYTY_COALESCE_FLUSH");
+		if (value == nullptr || *value == '\0') {
+			return 1u;
+		}
+		return static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+	}();
+	if (interval <= 1) {
+		Flush();
+		return;
+	}
+	if (++m_coalesced_flushes < interval) {
+		return;
+	}
+	m_coalesced_flushes = 0;
+	Flush();
+}
+
 void CommandScheduler::Finish() {
 	CheckActive();
 	if (!m_command.IsInvalid()) {
@@ -403,6 +426,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		result = graphics.queue.submit(1, &submit_info, nullptr);
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
+	m_coalesced_flushes = 0;
 
 	if (result != vk::Result::eSuccess) {
 		EXIT("vkQueueSubmit failed: %s, tick=%" PRIu64 "\n", vk::to_string(result).c_str(), tick);

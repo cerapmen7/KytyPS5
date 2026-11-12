@@ -224,8 +224,6 @@ private:
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
 
-	// Caller holds m_lock; it also serializes Image::picked.
-	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size) const;
 	// Whether the image was last used too long ago to be replaced. It counts garbage-collector
 	// ticks, which advance once per frame whatever the submit rate.
 	[[nodiscard]] bool          AccessedLongAgo(const Image& image) const;
