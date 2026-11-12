@@ -92,6 +92,10 @@ bool Thread::IsMainThread() {
 bool Thread::SetCurrentPriorityHighest() {
 	return SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) != 0;
 }
+
+bool Thread::SetCurrentAffinity(uint64_t mask) {
+	return SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(mask)) != 0;
+}
 #endif
 
 int Thread::GetThreadIdUnique() {

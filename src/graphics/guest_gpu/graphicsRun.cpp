@@ -420,6 +420,16 @@ void GuestGpu::ThreadRun(void* data) {
 	if (!Common::Thread::SetCurrentPriorityHighest()) {
 		LOGF("GPU: could not raise the GPU thread priority\n");
 	}
+	// Lab experiment: pin the GPU thread away from the cores the guest threads use most. The
+	// mask is a hex or decimal processor mask, e.g. 4 for CPU 2. Off when unset.
+	if (const auto* affinity = std::getenv("KYTY_GPU_AFFINITY");
+	    affinity != nullptr && *affinity != '\0') {
+		const auto mask = std::strtoull(affinity, nullptr, 0);
+		if (!Common::Thread::SetCurrentAffinity(mask)) {
+			LOGF("GPU: could not pin the GPU thread to mask 0x%llx\n",
+			     static_cast<unsigned long long>(mask));
+		}
+	}
 #endif
 	g_gpu_state = gpu;
 
