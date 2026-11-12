@@ -1046,6 +1046,8 @@ void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_
 void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector, void* address,
                                   uint64_t data, uint32_t interrupt_context_id,
                                   bool gl2_writeback) {
+	// The label or interrupt may be polled by the guest, so a deferred submit must not hold it.
+	GetScheduler().NoteGuestVisibleWork();
 	if (graphics_debug_dump_enabled()) {
 		LOGF("CommandProcessor::ReleaseMem()\n"
 		     "\t data_sel           = %" PRIu32 "\n"
@@ -1128,6 +1130,8 @@ void CommandProcessor::WriteBackImages() {
 
 void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
                                     uint64_t event_address) {
+	// Event registers can be noticed by the guest without waiting for a later fence.
+	GetScheduler().NoteGuestVisibleWork();
 	if (graphics_debug_dump_enabled()) {
 		LOGF("CommandProcessor::TriggerEvent()\n"
 		     "\t event_type  = 0x%08" PRIx32 "\n"

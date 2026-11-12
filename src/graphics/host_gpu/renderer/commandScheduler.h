@@ -34,9 +34,11 @@ public:
 	// whole command stream has been recorded. KYTY_OVERLAP_DRAWS sets the interval (0 disables).
 	void           FlushForOverlap();
 	// Like Flush, but can defer the submit across KYTY_COALESCE_FLUSH end-of-slice flushes so the
-	// CPU does not pay one vkQueueSubmit per guest submission. A Wait/Finish/frame boundary still
-	// submits everything recorded so far.
+	// CPU does not pay one vkQueueSubmit per guest submission. A Wait/Finish/frame boundary or a
+	// guest-visible completion (ReleaseMem/event) still submits everything recorded so far.
 	void           FlushCoalesced();
+	// Marks work the guest can poll (labels, interrupt events). A deferred submit may not hold it.
+	void           NoteGuestVisibleWork() noexcept { m_guest_visible_work = true; }
 	void           Finish();
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
@@ -137,6 +139,7 @@ private:
 	OperationState               m_operation_state      = OperationState::Open;
 	SubmitCadence                m_cadence;
 	uint32_t                     m_coalesced_flushes = 0;
+	bool                         m_guest_visible_work = false;
 };
 
 } // namespace Libs::Graphics

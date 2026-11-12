@@ -173,6 +173,13 @@ void CommandScheduler::FlushForOverlap() {
 }
 
 void CommandScheduler::FlushCoalesced() {
+	// A guest-visible label or event must reach the GPU now: waiting guests poll it, and holding
+	// the submit would deadlock the boot and gameplay loops.
+	if (m_guest_visible_work) {
+		m_guest_visible_work = false;
+		Flush();
+		return;
+	}
 	// The guest ends every submission slice with a flush. Submitting each one costs a
 	// vkQueueSubmit (~25 us on the lab machine) and the GPU is not the bottleneck in the
 	// depth-skipped mode, so record up to KYTY_COALESCE_FLUSH slices into one command buffer.
@@ -427,6 +434,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 	m_coalesced_flushes = 0;
+	m_guest_visible_work = false;
 
 	if (result != vk::Result::eSuccess) {
 		EXIT("vkQueueSubmit failed: %s, tick=%" PRIu64 "\n", vk::to_string(result).c_str(), tick);
