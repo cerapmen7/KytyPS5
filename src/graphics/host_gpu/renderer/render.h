@@ -201,6 +201,9 @@ public:
 	                    std::span<PreparedBindings* const> bindings);
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
+	// The PM4 front-end can drop a depth-only draw before it builds DrawIndexArgs. The executor's
+	// own check still runs, so a draw that survives this one is skipped where it was before.
+	[[nodiscard]] bool ShouldSkipDepthOnly(const CommandBuffer& buffer) const;
 
 private:
 	// False, with nothing drawn, when the draw's indirect records need CPU counts.

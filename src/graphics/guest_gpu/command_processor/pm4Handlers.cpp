@@ -720,6 +720,11 @@ KYTY_CP_OP_PARSER(CpOpDrawIndex) {
 	EXIT_NOT_IMPLEMENTED(index_count > max_index_count);
 	EXIT_NOT_IMPLEMENTED((flags & ~0x20u) != 0);
 
+	if (cp.ShouldSkipCurrentDraw()) {
+		Common::PerfProbe::Add(Common::PerfProbe::Slot::DepthOnlyDraw, 0);
+		return 5;
+	}
+
 	cp.DrawIndex({.index_count = index_count, .index_addr = index_addr});
 
 	return 5;
@@ -744,6 +749,10 @@ KYTY_CP_OP_PARSER(CpOpDrawIndexMultiInst) {
 
 	// DrawIndex replaces a zero instance count with NUM_INSTANCES.
 	if (instance_count != 0) {
+		if (cp.ShouldSkipCurrentDraw()) {
+			Common::PerfProbe::Add(Common::PerfProbe::Slot::DepthOnlyDraw, 0);
+			return 8;
+		}
 		cp.DrawIndex({.index_count    = index_count,
 		              .index_addr     = index_addr,
 		              .instance_count = instance_count});
@@ -778,6 +787,10 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirect) {
 			break;
 		}
 	}
+	if (cp.ShouldSkipCurrentDraw()) {
+		Common::PerfProbe::Add(Common::PerfProbe::Slot::DepthOnlyDraw, 0);
+		return 4 + packet_dw * (count - 1);
+	}
 	cp.DrawIndirectMulti(data_offset, count, nullptr, record_size, registers, draw_initiator,
 	                     indexed);
 
@@ -808,6 +821,11 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirectMulti) {
 		count_addr = nullptr;
 	}
 
+	if (cp.ShouldSkipCurrentDraw()) {
+		Common::PerfProbe::Add(Common::PerfProbe::Slot::DepthOnlyDraw, 0);
+		return 9;
+	}
+
 	cp.DrawIndirectMulti(data_offset, max_count_or_count, count_addr, stride_in_bytes,
 	                     registers, draw_initiator, indexed);
 
@@ -827,6 +845,11 @@ KYTY_CP_OP_PARSER(CpOpDrawIndexOffset) {
 	EXIT_NOT_IMPLEMENTED(index_count > max_index_size);
 	EXIT_NOT_IMPLEMENTED((flags & ~0x20u) != 0);
 
+	if (cp.ShouldSkipCurrentDraw()) {
+		Common::PerfProbe::Add(Common::PerfProbe::Slot::DepthOnlyDraw, 0);
+		return 4;
+	}
+
 	cp.DrawIndexOffset(index_offset, index_count);
 
 	return 4;
@@ -841,6 +864,11 @@ KYTY_CP_OP_PARSER(CpOpDrawIndexAuto) {
 	uint32_t flags       = buffer[1];
 
 	EXIT_NOT_IMPLEMENTED((flags & ~0x22u) != 0);
+
+	if (cp.ShouldSkipCurrentDraw()) {
+		Common::PerfProbe::Add(Common::PerfProbe::Slot::DepthOnlyDraw, 0);
+		return 2;
+	}
 
 	cp.DrawIndexAuto({.vertex_count = index_count});
 

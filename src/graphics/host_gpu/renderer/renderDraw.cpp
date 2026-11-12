@@ -888,6 +888,10 @@ static bool IsDepthOnlyDraw(const CommandBuffer& buffer) {
 	return z.z_write_base_addr != 0 || z.stencil_write_base_addr != 0;
 }
 
+bool RenderExecutor::ShouldSkipDepthOnly(const CommandBuffer& buffer) const {
+	return SkipDepthOnlyEnabled() && IsDepthOnlyDraw(buffer);
+}
+
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             DrawRenderState& state) {
 	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Programs);

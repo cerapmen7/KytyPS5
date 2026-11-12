@@ -863,6 +863,17 @@ void CommandProcessor::CountDraw() {
 	m_draws++;
 }
 
+bool CommandProcessor::ShouldSkipCurrentDraw() {
+	static const bool pm4_enabled = [] {
+		const auto* const value = std::getenv("KYTY_SKIP_DEPTH_PM4");
+		return value != nullptr && *value != '\0' && std::strtoul(value, nullptr, 10) != 0;
+	}();
+	if (!pm4_enabled) {
+		return false;
+	}
+	return m_renderer.GetRenderExecutor().ShouldSkipDepthOnly(CurrentBuffer());
+}
+
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	CountDraw();
 	args.index_type_and_size = m_index_type_and_size;
