@@ -414,9 +414,11 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		if (cached.call_source) {
 			source_changed = cached.RefreshCallSource(runtime);
 			if (!source_changed)
-				module = cached.FindModule<true>(runtime, push_data_cursor, push_data_ceiling);
+				module = cached.template FindModule<true>(runtime, push_data_cursor,
+				                                          push_data_ceiling);
 		} else {
-			module = cached.FindModule<false>(runtime, push_data_cursor, push_data_ceiling);
+			module = cached.template FindModule<false>(runtime, push_data_cursor,
+			                                           push_data_ceiling);
 		}
 		if (module != nullptr) return bind(*module);
 	}
@@ -465,8 +467,8 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		    program.resource_plan, runtime, program.resources, program.specialization));
 	} else if (source_changed) {
 		entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-		if (const auto* module =
-		        entry->second.FindModule<true>(runtime, push_data_cursor, push_data_ceiling)) {
+		if (const auto* module = entry->second.template FindModule<true>(
+		        runtime, push_data_cursor, push_data_ceiling)) {
 			return bind(*module);
 		}
 	}
