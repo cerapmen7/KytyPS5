@@ -99,6 +99,8 @@ struct ConfigOptions {
 	bool                   occlusion_queries_enabled   = true;
 	bool                   relaxed_shader_float        = false;
 	bool                   lod_stats_enabled           = false;
+	// Lets the GPU start on a long command stream instead of idling until the end-of-slice submit.
+	bool                   gpu_submit_cadence_enabled  = false;
 	bool                   trophy_enabled              = true;
 	uint32_t               trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled            = false;
@@ -179,6 +181,7 @@ bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
 bool RelaxedShaderFloatEnabled();
 bool LodStatsEnabled();
+bool GpuSubmitCadenceEnabled();
 bool TrophyEnabled();
 uint32_t GetTrophyDurationSeconds();
 bool PlayGoHackEnabled();
