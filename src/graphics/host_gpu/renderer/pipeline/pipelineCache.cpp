@@ -278,13 +278,9 @@ bool PipelineCache::Program::RefreshCallSource(const ShaderRecompiler::IR::SrtRu
 
 template <bool HasCalls>
 ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
-<<<<<<< HEAD
-                                                 uint32_t push_data_cursor) {
-	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::MatRes);
-=======
                                                  uint32_t push_data_cursor,
                                                  uint32_t push_data_ceiling) {
->>>>>>> 88e94686 (shader: place vertex-stage push data at the top of the push block)
+	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::MatRes);
 	EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
 	                                                    specialization));
 	for (auto& candidate: modules) {
@@ -417,16 +413,10 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		ShaderModule* module = nullptr;
 		if (cached.call_source) {
 			source_changed = cached.RefreshCallSource(runtime);
-<<<<<<< HEAD
-			if (!source_changed) module = cached.template FindModule<true>(runtime, push_data_cursor);
-		} else {
-			module = cached.template FindModule<false>(runtime, push_data_cursor);
-=======
 			if (!source_changed)
 				module = cached.FindModule<true>(runtime, push_data_cursor, push_data_ceiling);
 		} else {
 			module = cached.FindModule<false>(runtime, push_data_cursor, push_data_ceiling);
->>>>>>> 88e94686 (shader: place vertex-stage push data at the top of the push block)
 		}
 		if (module != nullptr) return bind(*module);
 	}
@@ -475,12 +465,8 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		    program.resource_plan, runtime, program.resources, program.specialization));
 	} else if (source_changed) {
 		entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-<<<<<<< HEAD
-		if (const auto* module = entry->second.template FindModule<true>(runtime, push_data_cursor)) {
-=======
 		if (const auto* module =
 		        entry->second.FindModule<true>(runtime, push_data_cursor, push_data_ceiling)) {
->>>>>>> 88e94686 (shader: place vertex-stage push data at the top of the push block)
 			return bind(*module);
 		}
 	}
