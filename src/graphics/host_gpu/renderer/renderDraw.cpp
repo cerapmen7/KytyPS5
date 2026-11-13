@@ -40,6 +40,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -608,6 +609,16 @@ static std::optional<DrawEmitInfo> ResolveDrawEmit(const HW::UserConfig&        
                                                    uint32_t                     first_instance,
                                                    const DrawIndirectArgs&      indirect);
 
+static bool DrawNeedsMetadataFlush(const CommandBuffer& buffer) {
+	const auto& hw = buffer.GetRegisters();
+	if (hw.GetColorControl().mode != 0) {
+		return true;
+	}
+	const auto& override = hw.GetDepthRenderOverride();
+	return override.force_z_dirty || override.force_z_valid || override.force_stencil_dirty ||
+	       override.force_stencil_valid;
+}
+
 static bool AsyncDrawPrepRequested() {
 	static const bool enabled = [] {
 		const auto* const value = std::getenv("KYTY_ASYNC_PREP");
@@ -616,13 +627,15 @@ static bool AsyncDrawPrepRequested() {
 	return enabled;
 }
 
-// One draw whose shader stages are prepared on a worker while the GPU thread records the
-// previous draw. The register and shader state are copied at capture, so later register
-// packets cannot change what this draw records.
+// A batch of draws whose shader stages are prepared by a small worker pool while the
+// GPU thread keeps decoding PM4. Each job owns its register/shader copies and resource
+// snapshots, so recording one draw cannot race a later draw with the same program.
 class DrawPrepQueue {
 public:
 	explicit DrawPrepQueue(RenderExecutor& executor): m_executor(executor) {
-		m_thread = std::jthread([this](std::stop_token stop) { Run(stop); });
+		for (uint32_t i = 0; i < WorkerCount; i++) {
+			m_workers.emplace_back([this](std::stop_token stop) { Run(stop); });
+		}
 	}
 	~DrawPrepQueue() {
 		{
@@ -630,117 +643,112 @@ public:
 			m_stop = true;
 		}
 		m_cv.notify_all();
+		for (auto& worker: m_workers) {
+			worker.request_stop();
+		}
 	}
 	KYTY_CLASS_NO_COPY(DrawPrepQueue);
 
 	void SubmitIndex(CommandBuffer& buffer, const DrawCallInfo& draw, const DrawIndexArgs& args,
 	                 DrawRenderState&& state, const DrawIndexBufferSource& index_source,
 	                 std::vector<uint16_t>&& expanded) {
-		Flush(buffer);
-		Capture(buffer, draw, state, index_source, std::move(expanded));
-		m_pending.indexed = true;
-		m_pending.index_args = args;
-		StartOrRecord(buffer);
+		auto job = Capture(buffer, draw, state, index_source, std::move(expanded));
+		job->indexed    = true;
+		job->index_args = args;
+		Enqueue(std::move(job));
 	}
 	void SubmitAuto(CommandBuffer& buffer, const DrawCallInfo& draw, const DrawAutoArgs& args,
 	                DrawRenderState&& state, const DrawIndexBufferSource& index_source,
 	                std::vector<uint16_t>&& expanded) {
-		Flush(buffer);
-		Capture(buffer, draw, state, index_source, std::move(expanded));
-		m_pending.indexed = false;
-		m_pending.auto_args = args;
-		StartOrRecord(buffer);
+		auto job = Capture(buffer, draw, state, index_source, std::move(expanded));
+		job->indexed   = false;
+		job->auto_args = args;
+		Enqueue(std::move(job));
 	}
-	[[nodiscard]] bool Pending() const noexcept { return m_pending.has; }
+	[[nodiscard]] bool Pending() const noexcept { return !m_jobs.empty(); }
 
 	void Flush(CommandBuffer& buffer) {
-		if (!m_pending.has) {
+		if (m_jobs.empty()) {
 			return;
 		}
-		bool async_ok = false;
+		std::fprintf(stderr, "FLUSH start jobs=%zu done=%zu\n", m_jobs.size(), m_done);
+		std::fflush(stderr);
 		{
 			std::unique_lock lock(m_mutex);
-			if (m_job_pending) {
-				m_cv.wait(lock, [this] { return m_job_done || m_stop; });
-				async_ok    = m_async_ok;
-				m_job_pending = false;
-			}
+			m_cv.wait(lock, [this] { return m_done == m_jobs.size() || m_stop; });
 		}
-		Record(buffer, async_ok);
-		m_pending.has = false;
+		std::fprintf(stderr, "FLUSH done jobs=%zu done=%zu\n", m_jobs.size(), m_done);
+		std::fflush(stderr);
+		for (auto& job: m_jobs) {
+			Record(buffer, *job);
+		}
+		m_jobs.clear();
+		m_next = 0;
+		m_done = 0;
 	}
 
 private:
-	struct PendingDraw {
-		HW::Context              registers;
-		HW::UserConfig           user_config;
-		HW::Shader               shaders;
-		DrawCallInfo             draw;
-		DrawIndexArgs            index_args;
-		DrawAutoArgs             auto_args;
-		DrawRenderState          state;
-		DrawIndexBufferSource    index_source;
-		std::vector<uint16_t>    expanded;
-		bool                     has     = false;
-		bool                     indexed = true;
+	static constexpr uint32_t WorkerCount = 4;
+
+	struct Job {
+		HW::Context                     registers;
+		HW::UserConfig                  user_config;
+		HW::Shader                      shaders;
+		DrawCallInfo                    draw;
+		DrawIndexArgs                   index_args;
+		DrawAutoArgs                    auto_args;
+		DrawRenderState                 state;
+		DrawIndexBufferSource           index_source;
+		std::vector<uint16_t>           expanded;
+		GraphicsPreparedResources       prepared_resources;
+		bool                            prepared = false;
+		bool                            indexed  = true;
 	};
 
-	static bool AsyncEnabled() { return AsyncDrawPrepRequested(); }
-
-	void Capture(CommandBuffer& buffer, const DrawCallInfo& draw, DrawRenderState& state,
-	             const DrawIndexBufferSource& index_source, std::vector<uint16_t>&& expanded) {
-		m_pending.registers   = buffer.GetRegisters();
-		m_pending.user_config = buffer.GetUserConfig();
-		m_pending.shaders     = buffer.GetShaders();
-		m_pending.draw        = draw;
-		m_pending.state       = std::move(state);
-		m_pending.index_source = index_source;
-		m_pending.expanded    = std::move(expanded);
-		if (!m_pending.expanded.empty()) {
-			m_pending.index_source.host_data = m_pending.expanded.data();
-		}
-		m_pending.has = true;
-	}
-	void StartOrRecord(CommandBuffer& buffer) {
-		if (!AsyncEnabled()) {
-			Record(buffer, false);
-			m_pending.has = false;
-			return;
-		}
+	void Enqueue(std::unique_ptr<Job>&& job) {
 		{
 			std::lock_guard lock(m_mutex);
-			m_job_done    = false;
-			m_async_ok    = false;
-			m_job_pending = true;
+			m_jobs.push_back(std::move(job));
 		}
 		m_cv.notify_all();
 	}
-	void Record(CommandBuffer& buffer, bool programs_ready) {
+
+	std::unique_ptr<Job> Capture(CommandBuffer& buffer, const DrawCallInfo& draw, DrawRenderState& state,
+	                             const DrawIndexBufferSource& index_source,
+	                             std::vector<uint16_t>&& expanded) {
+		auto job             = std::make_unique<Job>();
+		job->registers       = buffer.GetRegisters();
+		job->user_config     = buffer.GetUserConfig();
+		job->shaders         = buffer.GetShaders();
+		job->draw            = draw;
+		job->state           = std::move(state);
+		job->index_source    = index_source;
+		job->expanded        = std::move(expanded);
+		if (!job->expanded.empty()) {
+			job->index_source.host_data = job->expanded.data();
+		}
+		return job;
+	}
+
+	void Record(CommandBuffer& buffer, Job& job) {
 		auto* saved_registers   = buffer.m_registers;
 		auto* saved_user_config = buffer.m_user_config;
 		auto* saved_shaders     = buffer.m_shaders;
-		buffer.m_registers      = &m_pending.registers;
-		buffer.m_user_config    = &m_pending.user_config;
-		buffer.m_shaders        = &m_pending.shaders;
-		const bool ok = m_executor.CompleteDraw(buffer, m_pending.draw, m_pending.state,
-		                                        programs_ready);
+		buffer.m_registers      = &job.registers;
+		buffer.m_user_config    = &job.user_config;
+		buffer.m_shaders        = &job.shaders;
+		const bool ok = m_executor.CompleteDraw(buffer, job.draw, job.state, job.prepared);
 		if (ok) {
-			const auto emit = m_pending.indexed
-			                      ? ResolveDrawEmit(m_pending.user_config,
-			                                        m_pending.state.vertex_info[0],
-			                                        m_pending.index_args.offset_source,
-			                                        m_pending.index_args.base_vertex,
-			                                        m_pending.index_args.first_instance,
-			                                        m_pending.index_args.indirect)
-			                      : ResolveDrawEmit(m_pending.user_config,
-			                                        m_pending.state.vertex_info[0],
-			                                        m_pending.auto_args.offset_source,
-			                                        static_cast<int32_t>(m_pending.auto_args.first_vertex),
-			                                        m_pending.auto_args.first_instance,
-			                                        m_pending.auto_args.indirect);
+			const auto emit =
+			    job.indexed ? ResolveDrawEmit(job.user_config, job.state.vertex_info[0],
+			                                  job.index_args.offset_source, job.index_args.base_vertex,
+			                                  job.index_args.first_instance, job.index_args.indirect)
+			                : ResolveDrawEmit(job.user_config, job.state.vertex_info[0],
+			                                  job.auto_args.offset_source,
+			                                  static_cast<int32_t>(job.auto_args.first_vertex),
+			                                  job.auto_args.first_instance, job.auto_args.indirect);
 			if (emit) {
-				m_executor.ExecutePreparedDraw(buffer, m_pending.draw, m_pending.state, *emit,
-				                               m_pending.index_source);
+				m_executor.ExecutePreparedDraw(buffer, job.draw, job.state, *emit, job.index_source);
 			}
 		}
 		m_executor.ResetBindings();
@@ -748,38 +756,48 @@ private:
 		buffer.m_user_config = saved_user_config;
 		buffer.m_shaders     = saved_shaders;
 	}
+
 	void Run(std::stop_token stop) {
 		for (;;) {
+			Job* job = nullptr;
 			{
 				std::unique_lock lock(m_mutex);
 				m_cv.wait(lock, [this, &stop] {
-					return m_stop || stop.stop_requested() || (m_job_pending && !m_job_done);
+					return m_stop || stop.stop_requested() || m_next < m_jobs.size();
 				});
 				if (m_stop || stop.stop_requested()) {
 					return;
 				}
+				job = m_jobs[m_next++].get();
 			}
-			const bool ok = m_executor.m_context.GetPipelineCache().GetGraphicsPrograms(
-			    m_pending.registers, m_pending.user_config, m_pending.shaders, m_pending.state,
-			    true);
+			std::fprintf(stderr, "WORK start hash=%llx\n",
+			             static_cast<unsigned long long>(job->registers.GetShaderRegisters().m_cbShaderMask));
+			std::fflush(stderr);
+			bool ok = false;
+			if (AsyncDrawPrepRequested()) {
+				ok = m_executor.m_context.GetPipelineCache().GetGraphicsPrograms(
+				    job->registers, job->user_config, job->shaders, job->state, true,
+				    &job->prepared_resources);
+			}
+			job->prepared = ok;
+			std::fprintf(stderr, "WORK done ok=%d\n", ok ? 1 : 0);
+			std::fflush(stderr);
 			{
 				std::lock_guard lock(m_mutex);
-				m_async_ok = ok;
-				m_job_done = true;
+				m_done++;
 			}
 			m_cv.notify_all();
 		}
 	}
 
-	RenderExecutor&          m_executor;
-	PendingDraw              m_pending;
-	std::mutex               m_mutex;
-	std::condition_variable  m_cv;
-	bool                     m_job_pending = false;
-	bool                     m_job_done    = false;
-	bool                     m_async_ok    = false;
-	bool                     m_stop        = false;
-	std::jthread             m_thread;
+	RenderExecutor&                       m_executor;
+	std::deque<std::unique_ptr<Job>>      m_jobs;
+	std::vector<std::jthread>             m_workers;
+	std::mutex                            m_mutex;
+	std::condition_variable               m_cv;
+	size_t                                m_next = 0;
+	size_t                                m_done = 0;
+	bool                                  m_stop = false;
 };
 
 // The task shader's inputs for an indirect mesh draw: Params in gpu_mesh_indirect.task.
@@ -1656,7 +1674,9 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 		return true;
 	}
 	m_context.GetCommandScheduler().PopPendingOperations();
-	FlushPendingDraw();
+	if (DrawNeedsMetadataFlush(buffer)) {
+		FlushPendingDraw();
+	}
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -1766,7 +1786,9 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 		return true;
 	}
 	m_context.GetCommandScheduler().PopPendingOperations();
-	FlushPendingDraw();
+	if (DrawNeedsMetadataFlush(buffer)) {
+		FlushPendingDraw();
+	}
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 
