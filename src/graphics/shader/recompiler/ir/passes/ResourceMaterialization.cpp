@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include "common/assert.h"
+#include "common/perfProbe.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
@@ -1594,9 +1595,12 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	     std::ranges::any_of(program.descriptor_sources, uses_workgroup_count));
 	auto& reads = snapshot.specialization_reads;
 	reads = program.source_reads;
-	if (!WalkSrt(program, runtime, snapshot.flattened_srt, capture_reads ? &reads : nullptr)) {
-		return SpecializationFail(fmt::format("SRT refresh complete={} reads={} user_data={}",
-		    program.srt_plan_complete, program.srt_reads.size(), runtime.user_data.size()));
+	{
+		Common::PerfProbe::Scope walk(Common::PerfProbe::Slot::MatWalk);
+		if (!WalkSrt(program, runtime, snapshot.flattened_srt, capture_reads ? &reads : nullptr)) {
+			return SpecializationFail(fmt::format("SRT refresh complete={} reads={} user_data={}",
+			    program.srt_plan_complete, program.srt_reads.size(), runtime.user_data.size()));
+		}
 	}
 	SrtReadCapture capture {runtime, reads};
 	auto observed = capture_reads ? capture.ObservedRuntime() : runtime;
@@ -1648,7 +1652,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		    kind, resource, source, candidates));
 	};
 	snapshot.buffers.resize(program.info.buffers.size());
-	specialization.buffers.assign(program.info.buffers.size(), {});
+	// Every field is overwritten below; resize avoids clearing the whole array first.
+	specialization.buffers.resize(program.info.buffers.size());
+	{
+	Common::PerfProbe::Scope mat_buffers(Common::PerfProbe::Slot::MatBuf);
 	for (uint32_t i = 0; i < snapshot.buffers.size(); ++i) {
 		const auto base_index =
 		    i < program.info.buffers.size() ? i : specialization.buffers[i].indirect_root;
@@ -1698,8 +1705,11 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
 		buffer.scalar_empty       = base.scalar && descriptor.GetSize() == 0u;
 	}
+	}
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());
+	{
+	Common::PerfProbe::Scope mat_images(Common::PerfProbe::Slot::MatImg);
 	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
 		const auto& image = program.info.images[i];
 		specialization.images[i] = {
@@ -1746,8 +1756,9 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			}
 		}
 	}
+	}
 	snapshot.samplers.resize(program.info.samplers.size());
-	specialization.samplers.assign(program.info.samplers.size(), {});
+	specialization.samplers.resize(program.info.samplers.size());
 	for (uint32_t i = 0; i < snapshot.samplers.size(); ++i) {
 		const auto base_index =
 		    i < program.info.samplers.size() ? i : specialization.samplers[i].indirect_root;
@@ -1783,7 +1794,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
-	return BuildResourceSpecialization(program, snapshot, specialization);
+	{
+		Common::PerfProbe::Scope mat_spec(Common::PerfProbe::Slot::MatSpec);
+		return BuildResourceSpecialization(program, snapshot, specialization);
+	}
 }
 
 uint32_t ImageHeapKind(const ImageResource& root, DescriptorValue& value) {

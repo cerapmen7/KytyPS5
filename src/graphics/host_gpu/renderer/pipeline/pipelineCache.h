@@ -18,6 +18,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -33,6 +34,12 @@ namespace Libs::Graphics {
 struct GraphicContext;
 struct ShaderParams;
 class CommandBuffer;
+
+namespace HW {
+class Context;
+class UserConfig;
+class Shader;
+} // namespace HW
 
 namespace ShaderRecompiler {
 struct CompileOptions;
@@ -207,6 +214,12 @@ public:
 
 	// Reads the shaders and registers bound in `command` into the state's shader stages.
 	void GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state);
+	// Same preparation from copied state, so a worker can run it ahead of the GPU thread.
+	// Returns false without touching the image heap when the shaders need it or are not
+	// known yet; the caller then runs the synchronous path.
+	bool GetGraphicsPrograms(const HW::Context& context, const HW::UserConfig& user_config,
+	                         const HW::Shader& shaders, DrawRenderState& state, bool allow_async);
+	[[nodiscard]] bool UsesImageHeap(ShaderType stage, uint64_t hash) const;
 	// Null skips the dispatch.
 	const ShaderModule* GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                      ShaderComputeInputInfo&      input_info);
@@ -261,6 +274,9 @@ private:
 	GraphicContext&                        m_graphics;
 	ShaderRecompiler::IR::ImageHeapSource* m_image_heap;
 	std::unordered_map<ProgramKey, Program, ProgramKeyHash> m_program_cache;
+	// Serializes program preparation between the GPU thread and its draw-preparation worker.
+	mutable std::mutex m_program_mutex;
+	mutable std::map<std::pair<ShaderType, uint64_t>, bool> m_heap_shaders;
 	// Modules compiled per stage.
 	std::array<uint32_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> m_compiled {};
 	ProgramKey                             m_lookup_key;
@@ -276,7 +292,7 @@ private:
 
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
-	                               uint32_t& push_data_cursor);
+	                               uint32_t& push_data_cursor, bool allow_compile = true);
 	ShaderModule& CompileModule(Program& program, const ProgramKey& key,
 	                            ShaderRecompiler::CompileOptions  options,
 	                            ShaderRecompiler::TranslateResult translated,

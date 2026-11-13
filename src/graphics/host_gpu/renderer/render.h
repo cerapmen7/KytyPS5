@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -102,6 +103,12 @@ public:
 	void EndRendering() const;
 
 	[[nodiscard]] vk::CommandBuffer Handle() const noexcept { return m_buffer; }
+	// Binding state persists in a command buffer, so writing the same handles again only
+	// costs a driver call. The cached forms skip those redundant calls.
+	void BindPipelineCached(vk::Pipeline pipeline);
+	void BindVertexBuffersCached(uint32_t count, const vk::Buffer* buffers, const uint64_t* offsets,
+	                             const uint64_t* sizes);
+	void BindIndexBufferCached(vk::Buffer buffer, uint64_t offset, vk::IndexType type);
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
 	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
@@ -127,8 +134,17 @@ private:
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;
+	vk::Pipeline        m_bound_pipeline = nullptr;
+	uint32_t            m_bound_vertex_count = 0;
+	std::array<vk::Buffer, 32> m_bound_vertex_buffers {};
+	std::array<uint64_t, 32>   m_bound_vertex_offsets {};
+	std::array<uint64_t, 32>   m_bound_vertex_sizes {};
+	vk::Buffer          m_bound_index_buffer = nullptr;
+	uint64_t            m_bound_index_offset = 0;
+	vk::IndexType       m_bound_index_type   = vk::IndexType::eUint16;
 
 	friend class CommandScheduler;
+	friend class DrawPrepQueue;
 	friend struct CommandBufferTestAccess;
 };
 
@@ -180,6 +196,8 @@ struct BufferObtainCache {
 	}
 };
 
+class DrawPrepQueue;
+
 class RenderExecutor {
 public:
 	explicit RenderExecutor(RenderContext& context): m_context(context) {}
@@ -204,8 +222,13 @@ public:
 	// The PM4 front-end can drop a depth-only draw before it builds DrawIndexArgs. The executor's
 	// own check still runs, so a draw that survives this one is skipped where it was before.
 	[[nodiscard]] bool ShouldSkipDepthOnly(const CommandBuffer& buffer) const;
+	// Records a draw whose program preparation is still in flight. Must run before a packet
+	// that can change guest memory or before a submit.
+	void FlushPendingDraw();
+	[[nodiscard]] bool HasPendingDraw() const;
 
 private:
+	friend class DrawPrepQueue;
 	// False, with nothing drawn, when the draw's indirect records need CPU counts.
 	bool DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args);
 	bool DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args);
@@ -226,6 +249,10 @@ private:
 	                                    const DrawEmitInfo& emit, const DrawRenderState& state);
 	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                          DrawRenderState& state);
+	[[nodiscard]] bool FinalizeDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
+	                                           DrawRenderState& state);
+	[[nodiscard]] bool CompleteDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
+	                                DrawRenderState& state, bool programs_ready);
 	void               ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                       const DrawRenderState& state, const DrawEmitInfo& emit,
 	                                       const DrawIndexBufferSource& index_source);
@@ -262,6 +289,8 @@ private:
 	};
 
 	RenderContext&                        m_context;
+	std::shared_ptr<DrawPrepQueue>        m_draw_prep;
+	DrawPrepQueue&                        GetDrawPrep();
 	bool                                  m_lod_stats = Config::LodStatsEnabled();
 	GraphicsBindings                     m_graphics_bindings;
 	// The current draw's targets; PrepareDrawRenderState resolves them again for each draw.

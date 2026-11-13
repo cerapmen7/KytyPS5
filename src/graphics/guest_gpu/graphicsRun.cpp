@@ -222,7 +222,8 @@ void CommandProcessor::BufferInit() {
 }
 
 void CommandProcessor::BufferFlush() {
-	m_renderer.GetBufferCache().PublishReadHot();
+	m_renderer.GetRenderExecutor().FlushPendingDraw();
+	m_renderer.GetBufferCache().PublishReadHotCoalesced();
 	GetScheduler().FlushCoalesced();
 	// The occlusion counters reach a guest that polls them without waiting for a later fence.
 	m_renderer.GetOcclusionQueries().Publish();
@@ -239,6 +240,7 @@ void CommandProcessor::FlushForCadence() {
 
 void CommandProcessor::BufferWait() {
 	BufferInit();
+	m_renderer.GetRenderExecutor().FlushPendingDraw();
 	GetScheduler().Finish();
 }
 
@@ -590,9 +592,63 @@ void CommandProcessor::SuspendPm4() {
 	g_current_execution->m_suspended = true;
 }
 
+// Packet-level census used by the lab only. It keeps the per-opcode share of the PM4
+// front-end visible without adding a clock read to the production path.
+static Common::PerfProbe::Slot Pm4OpcodeSlot(uint32_t opcode) noexcept {
+	switch (opcode) {
+		case Pm4::IT_SET_SH_REG: return Common::PerfProbe::Slot::OpSh;
+		case Pm4::IT_SET_UCONFIG_REG:
+		case Pm4::IT_SET_UCONFIG_REG_INDEX: return Common::PerfProbe::Slot::OpUc;
+		case Pm4::IT_SET_CONTEXT_REG: return Common::PerfProbe::Slot::OpCfg;
+		case Pm4::IT_SET_SH_REG_INDIRECT:
+		case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
+		case Pm4::IT_SET_CONTEXT_REG_INDIRECT: return Common::PerfProbe::Slot::OpIndirect;
+		case Pm4::IT_DRAW_INDEX_2:
+		case Pm4::IT_DRAW_INDEX_OFFSET_2:
+		case Pm4::IT_DRAW_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_INDIRECT:
+		case Pm4::IT_DRAW_INDIRECT_MULTI:
+		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI:
+		case Pm4::IT_DISPATCH_DIRECT:
+		case Pm4::IT_DISPATCH_INDIRECT: return Common::PerfProbe::Slot::OpDraw;
+		case Pm4::IT_DMA_DATA: return Common::PerfProbe::Slot::OpDma;
+		case Pm4::IT_ACQUIRE_MEM: return Common::PerfProbe::Slot::OpAcquire;
+		case Pm4::IT_COPY_DATA: return Common::PerfProbe::Slot::OpCopy;
+		case Pm4::IT_INDIRECT_BUFFER: return Common::PerfProbe::Slot::OpIndirect;
+		case Pm4::IT_WAIT_REG_MEM:
+		case Pm4::IT_WAIT_REG_MEM_64: return Common::PerfProbe::Slot::OpWait;
+		case Pm4::IT_MEM_SEMAPHORE: return Common::PerfProbe::Slot::OpSem;
+		case Pm4::IT_NOP: return Common::PerfProbe::Slot::OpNop;
+		default: return Common::PerfProbe::Slot::OpOther;
+	}
+}
+
+// Packets that only change decoded register state can stay behind a deferred draw. Anything
+// that can write guest memory, submit work or start a nested command buffer drains it first.
+static bool Pm4KeepsPendingDraw(uint32_t opcode) noexcept {
+	switch (opcode) {
+		case Pm4::IT_SET_SH_REG:
+		case Pm4::IT_SET_SH_REG_INDIRECT:
+		case Pm4::IT_SET_UCONFIG_REG:
+		case Pm4::IT_SET_UCONFIG_REG_INDEX:
+		case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
+		case Pm4::IT_SET_CONTEXT_REG:
+		case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
+		case Pm4::IT_NOP:
+		case Pm4::IT_DRAW_INDEX_2:
+		case Pm4::IT_DRAW_INDEX_OFFSET_2:
+		case Pm4::IT_DRAW_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_INDIRECT:
+		case Pm4::IT_DRAW_INDIRECT_MULTI:
+		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI: return true;
+		default: return false;
+	}
+}
+
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Pm4);
-	const bool debug_dump = graphics_debug_dump_enabled();
+	const bool debug_dump     = graphics_debug_dump_enabled();
+	const bool submit_cadence = GetScheduler().SubmitCadenceEnabled();
 	// The pending-commands counter lives on a cache line the guest threads keep dirtying;
 	// reading it per packet costs a cross-core transfer. Checking every 64 packets keeps the
 	// interleave granularity far below a packet batch while cutting those loads ~98%.
@@ -650,6 +706,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			continue;
 		}
 
+		if (!Pm4KeepsPendingDraw(opcode)) {
+			m_renderer.GetRenderExecutor().FlushPendingDraw();
+		}
 		auto handler = g_cp_op_func[opcode];
 
 		if (handler == nullptr) {
@@ -667,8 +726,15 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			EXIT("unknown op\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32 "\n", offset, packet_header);
 		}
 
-		const auto packet_dw =
-		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		uint32_t packet_dw = 0;
+		if (Common::PerfProbe::Enabled()) {
+			Common::PerfProbe::Scope op_probe(Pm4OpcodeSlot(opcode));
+			packet_dw =
+			    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		} else {
+			packet_dw =
+			    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		}
 		EXIT_IF(packet_dw > remaining_dw);
 		made_progress = true;
 		if (execution.m_suspended) {
@@ -688,13 +754,27 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		// Only here, after a whole packet, and never inside a handler. Handlers hold a
 		// CommandBuffer reference and some capture CurrentTick() as covering what they just
 		// recorded. The cursor is not used, because the call push_back above can dangle it.
-		FlushForCadence();
+		if (submit_cadence) {
+			FlushForCadence();
+		}
 	}
 	execution.m_made_progress = made_progress;
 }
 
 void CommandProcessor::SetIndexType(uint32_t index_type_and_size) {
 	m_index_type_and_size = index_type_and_size & 0x3u;
+}
+
+CommandProcessor::RegisterShadow CommandProcessor::GetRegisterShadow(RegisterSpace space) noexcept {
+	switch (space) {
+		case RegisterSpace::Cx:
+			return {m_shadow_cx_value.data(), m_shadow_cx_epoch.data(), m_shadow_cx_gen};
+		case RegisterSpace::Sh:
+			return {m_shadow_sh_value.data(), m_shadow_sh_epoch.data(), m_shadow_sh_gen};
+		case RegisterSpace::Uc:
+			return {m_shadow_uc_value.data(), m_shadow_uc_epoch.data(), m_shadow_uc_gen};
+		default: return {};
+	}
 }
 
 bool CommandProcessor::ConsumeRegisterWrite(RegisterSpace space, uint32_t offset,
@@ -1046,8 +1126,6 @@ void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_
 void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector, void* address,
                                   uint64_t data, uint32_t interrupt_context_id,
                                   bool gl2_writeback) {
-	// The label or interrupt may be polled by the guest, so a deferred submit must not hold it.
-	GetScheduler().NoteGuestVisibleWork();
 	if (graphics_debug_dump_enabled()) {
 		LOGF("CommandProcessor::ReleaseMem()\n"
 		     "\t data_sel           = %" PRIu32 "\n"
@@ -1072,12 +1150,18 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 		WriteBackImages();
 	}
 	if (data_sel == 0 && !interrupt) {
+		// No label and no interrupt: this release only orders caches, which the renderer's
+		// resource barriers already cover. It must not force a deferred submit.
 		return;
 	}
+	// The label or interrupt may be polled by the guest, so a deferred submit must not hold it.
+	GetScheduler().NoteGuestVisibleWork();
 
 	// Dumped occlusion counters are written before any end-of-pipe signal reaches the guest.
 	m_renderer.GetOcclusionQueries().Publish();
-	m_renderer.GetBufferCache().PublishReadHot();
+	// A label only needs the bytes under it; the guest's read path downloads those on demand.
+	// Publishing every recently written range here would repeat the work at every signal.
+	m_renderer.GetBufferCache().PublishReadHotCoalesced();
 
 	// A label beside GPU-written bytes goes to the backing store, so they are not downloaded.
 	// Other labels go through the guest mapping: its fault keeps a clean cached copy current and
@@ -1130,8 +1214,6 @@ void CommandProcessor::WriteBackImages() {
 
 void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
                                     uint64_t event_address) {
-	// Event registers can be noticed by the guest without waiting for a later fence.
-	GetScheduler().NoteGuestVisibleWork();
 	if (graphics_debug_dump_enabled()) {
 		LOGF("CommandProcessor::TriggerEvent()\n"
 		     "\t event_type  = 0x%08" PRIx32 "\n"
@@ -1181,6 +1263,10 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 				     event_index, event_address);
 			}
 			if (auto& queries = m_renderer.GetOcclusionQueries(); queries.Enabled()) {
+				// The dumped counters are guest-visible data written by the GPU, so the
+				// submit that covers this dump must not be deferred. The cache-only event
+				// types above produce no guest-visible bytes and can stay coalesced.
+				GetScheduler().NoteGuestVisibleWork();
 				queries.Dump(event_address);
 				break;
 			}
@@ -1212,6 +1298,7 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 	if (graphics_debug_dump_enabled()) {
 		LOGF("CommandProcessor::Flip()\n");
 	}
+	m_renderer.GetRenderExecutor().FlushPendingDraw();
 	m_renderer.GetOcclusionQueries().Publish();
 	m_renderer.GetBufferCache().DecayReadHot();
 	m_renderer.GetBufferCache().PublishReadHot();
@@ -1224,6 +1311,7 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 }
 
 void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
+	m_renderer.GetRenderExecutor().FlushPendingDraw();
 	auto& command = CurrentBuffer();
 	m_renderer.GetBufferCache().DecayReadHot();
 	m_renderer.GetBufferCache().PublishReadHot();

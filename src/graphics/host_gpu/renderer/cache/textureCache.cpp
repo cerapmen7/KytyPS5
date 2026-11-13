@@ -2118,6 +2118,22 @@ bool TextureCache::IsRegionRegistered(uint64_t address, uint64_t size) {
 	return registered;
 }
 
+bool TextureCache::MayContainImage(uint64_t address, uint64_t size) {
+	if (size == 0 || size > (uint64_t {1} << 20u)) {
+		return true;
+	}
+	constexpr uint64_t page_bits = ImagePageTable::kPageBits;
+	const auto         first     = address >> page_bits;
+	const auto         last      = (address + size - 1) >> page_bits;
+	std::scoped_lock   lock {m_lock};
+	for (auto page = first; page <= last; ++page) {
+		if (m_image_page_table.Find(page) != nullptr) {
+			return true;
+		}
+	}
+	return false;
+}
+
 void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	m_surface_metas.erase(m_surface_metas.lower_bound(address),

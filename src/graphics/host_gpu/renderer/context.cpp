@@ -29,6 +29,49 @@ void CommandBuffer::Begin() {
 	auto result = buffer.begin(&begin_info);
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	m_bound_pipeline       = nullptr;
+	m_bound_vertex_count   = 0;
+	m_bound_index_buffer   = nullptr;
+	m_bound_index_offset   = 0;
+	m_bound_index_type     = vk::IndexType::eUint16;
+}
+
+void CommandBuffer::BindPipelineCached(vk::Pipeline pipeline) {
+	if (m_bound_pipeline == pipeline) {
+		return;
+	}
+	m_bound_pipeline = pipeline;
+	Handle().bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+}
+
+void CommandBuffer::BindVertexBuffersCached(uint32_t count, const vk::Buffer* buffers,
+                                            const uint64_t* offsets, const uint64_t* sizes) {
+	if (count == m_bound_vertex_count && count <= m_bound_vertex_buffers.size() &&
+	    std::memcmp(buffers, m_bound_vertex_buffers.data(), count * sizeof(vk::Buffer)) == 0 &&
+	    std::memcmp(offsets, m_bound_vertex_offsets.data(), count * sizeof(uint64_t)) == 0 &&
+	    std::memcmp(sizes, m_bound_vertex_sizes.data(), count * sizeof(uint64_t)) == 0) {
+		return;
+	}
+	m_bound_vertex_count = std::min<uint32_t>(count, m_bound_vertex_buffers.size());
+	if (m_bound_vertex_count != 0) {
+		std::memcpy(m_bound_vertex_buffers.data(), buffers,
+		            m_bound_vertex_count * sizeof(vk::Buffer));
+		std::memcpy(m_bound_vertex_offsets.data(), offsets,
+		            m_bound_vertex_count * sizeof(uint64_t));
+		std::memcpy(m_bound_vertex_sizes.data(), sizes, m_bound_vertex_count * sizeof(uint64_t));
+	}
+	Handle().bindVertexBuffers2(0, count, buffers, offsets, sizes, nullptr);
+}
+
+void CommandBuffer::BindIndexBufferCached(vk::Buffer buffer, uint64_t offset, vk::IndexType type) {
+	if (m_bound_index_buffer == buffer && m_bound_index_offset == offset &&
+	    m_bound_index_type == type) {
+		return;
+	}
+	m_bound_index_buffer = buffer;
+	m_bound_index_offset = offset;
+	m_bound_index_type   = type;
+	Handle().bindIndexBuffer(buffer, offset, type);
 }
 
 void CommandBuffer::End() const {

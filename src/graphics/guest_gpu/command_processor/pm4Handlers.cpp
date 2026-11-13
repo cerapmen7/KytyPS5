@@ -1289,6 +1289,11 @@ static uint32_t SetRegisters(CommandProcessor& cp, const Table& table,
                              CommandProcessor::RegisterSpace space, uint32_t cmd_id,
                              uint32_t cmd_offset, const uint32_t* values, uint32_t position) {
 	const auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
+	// The guest re-emits its full state block per draw. The shadow lets the loop skip a value
+	// that repeats without a per-register switch or function call. Offsets that also have a
+	// dedicated handler stay unshadowed: those handlers may update storage outside the raw
+	// register tables, and the direct SET_SH_REG path can write them too.
+	auto shadow = cp.GetRegisterShadow(space);
 	for (uint32_t i = 0; i < num_values; i++) {
 		const auto offset = cmd_offset + i;
 		if (offset >= std::size(table) || table[offset] == nullptr) {
@@ -1296,10 +1301,18 @@ static uint32_t SetRegisters(CommandProcessor& cp, const Table& table,
 			     "\n\tcmd_offset = %08" PRIx32 "\n",
 			     position, cmd_id, offset);
 		}
-		// Identical rewrites of a register cannot change the decoded state (every handler
-		// is a pure decode or a field-preserving merge); skip the indirect call.
-		if (cp.ConsumeRegisterWrite(space, offset, values[i])) {
-			continue;
+		const bool special =
+		    (space == CommandProcessor::RegisterSpace::Sh && g_hw_sh_func[offset] != nullptr) ||
+		    (space == CommandProcessor::RegisterSpace::Uc && offset == Pm4::VGT_INDEX_TYPE);
+		if (!special && shadow.values != nullptr) {
+			if (shadow.epochs[offset] == shadow.gen) {
+				if (shadow.values[offset] == values[i]) {
+					continue;
+				}
+			} else {
+				shadow.epochs[offset] = shadow.gen;
+			}
+			shadow.values[offset] = values[i];
 		}
 		table[offset](cp, offset, values[i]);
 	}

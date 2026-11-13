@@ -38,6 +38,8 @@
 #include <span>
 #include <vector>
 
+#include <xxhash.h>
+
 namespace Libs::Graphics {
 
 namespace {
@@ -726,7 +728,10 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::PrepareStages);
-	EXIT_IF(!runtime);
+	if (!runtime) {
+		EXIT("PrepareBindings: null stage module=%p resources=%p", static_cast<const void*>(runtime.module),
+		     static_cast<const void*>(runtime.resources));
+	}
 	const auto& program  = runtime.module->info;
 	const auto& snapshot = *runtime.resources;
 	prepared.runtime = &runtime;
@@ -864,6 +869,25 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 				prepared.shader_data[layout.MemorySizeDword() + index] = entry.shader_size;
 				continue;
 			}
+			// A CPU write does not always mean new bytes: the scene rewrites the same static
+			// constants every frame. Compare the content before paying for an upload and a
+			// descriptor rewrite. GPU-owned ranges are not read (that would force a download).
+			uint64_t pending_hash  = 0;
+			bool     pending_valid = false;
+			if (entry.valid && entry.source == source && source.address != 0 && source.size != 0 &&
+			    source.size <= 8ull * 1024 * 1024 && !resource.written && !formatted &&
+			    buffer_cache.IsRegionCpuModified(source.address, source.size) &&
+			    !buffer_cache.HasGpuDirtyBytes(source.address, source.size)) {
+				pending_hash = XXH3_64bits(reinterpret_cast<const void*>(source.address), source.size);
+				pending_valid = true;
+				if (entry.hash_valid && entry.content_hash == pending_hash) {
+					prepared.buffers[index] = entry.info;
+					pack_memory_offset(index, entry.shader_size -
+					                              static_cast<uint32_t>(source.size));
+					prepared.shader_data[layout.MemorySizeDword() + index] = entry.shader_size;
+					continue;
+				}
+			}
 			uint32_t buffer_offset = 0;
 			prepared.buffers[index] = NativeStorageBuffer(m_context, source, resource,
 			                                              buffer_offset, m_obtain_cache);
@@ -874,6 +898,8 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			entry = {.source = source,
 			         .info   = prepared.buffers[index],
 			         .shader_size = shader_size,
+			         .content_hash = pending_hash,
+			         .hash_valid   = pending_valid,
 			         .valid       = source.address != 0 && source.size != 0 && !resource.written &&
 			                          !formatted};
 		}

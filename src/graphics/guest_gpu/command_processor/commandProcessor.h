@@ -86,6 +86,15 @@ public:
 	// written outside the shadowed paths (the direct SET_SH_REG handlers, VGT_INDEX_TYPE)
 	// are never shadowed. Bulk rewrites invalidate a space in O(1) through an epoch stamp.
 	enum class RegisterSpace : uint8_t { Cx, Sh, Uc };
+	struct RegisterShadow {
+		uint32_t* values = nullptr;
+		uint32_t* epochs = nullptr;
+		uint32_t  gen    = 0;
+	};
+	// Bulk form used by SET_*_REG packets: the caller applies the table handlers itself and
+	// uses this storage to skip unchanged values without a per-register switch. Null storage
+	// means that the whole space is unshadowed and every value must be applied.
+	[[nodiscard]] RegisterShadow GetRegisterShadow(RegisterSpace space) noexcept;
 	// Returns true when the write repeats the current shadowed value and may be skipped;
 	// otherwise records the value and returns false (the caller applies the handler).
 	bool ConsumeRegisterWrite(RegisterSpace space, uint32_t offset, uint32_t value);

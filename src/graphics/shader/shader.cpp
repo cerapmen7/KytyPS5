@@ -31,6 +31,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
 #include <xxhash.h>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -430,29 +431,76 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 	}
 	const auto& metadata = data.vertex;
 
+	const uint32_t* attrib = nullptr;
+	const uint32_t* buffer = nullptr;
 	if (metadata.vertex_attrib_reg >= 0) {
 		info.has_dynamic_vertex_fetch = true;
 		info.fetch_attrib_reg         = metadata.vertex_attrib_reg;
 		info.fetch_buffer_reg         = metadata.vertex_buffer_reg;
-
-		const auto* attrib = reinterpret_cast<const uint32_t*>(
+		attrib = reinterpret_cast<const uint32_t*>(
 		    static_cast<uint64_t>(user_sgpr.value[metadata.vertex_attrib_reg]) |
 		    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_attrib_reg + 1]) << 32u));
-		const auto* buffer = reinterpret_cast<const uint32_t*>(
+		buffer = reinterpret_cast<const uint32_t*>(
 		    static_cast<uint64_t>(user_sgpr.value[metadata.vertex_buffer_reg]) |
 		    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_buffer_reg + 1]) << 32u));
-
 		if (attrib == nullptr || buffer == nullptr) {
 			LOGF("ShaderGetVertexInputInfo(): null vertex table pointer shader=0x%016" PRIx64 "\n",
 			     shader_addr);
 			return false;
 		}
+	}
 
+	// The decoded fetch tables repeat across hundreds of shadow draws. Hash the immutable
+	// shader metadata and the table contents; a hit copies the decoded struct instead of
+	// walking the tables again.
+	struct CacheEntry {
+		uint64_t              key   = 0;
+		bool                  valid = false;
+		ShaderVertexInputInfo info {};
+	};
+	constexpr size_t kCacheSize = 1024;
+	static thread_local std::array<CacheEntry, kCacheSize> cache {};
+	uint64_t key = XXH3_64bits(&shader_addr, sizeof(shader_addr));
+	key          = XXH3_64bits_withSeed(&sh.m_paClVsOutCntl, sizeof(sh.m_paClVsOutCntl), key);
+	key          = XXH3_64bits_withSeed(&data.type, sizeof(data.type), key);
+	key          = XXH3_64bits_withSeed(&data.code_size_bytes, sizeof(data.code_size_bytes), key);
+	key = XXH3_64bits_withSeed(&data.scratch_size_dwords, sizeof(data.scratch_size_dwords), key);
+	key = XXH3_64bits_withSeed(&metadata.vertex_attrib_reg, sizeof(metadata.vertex_attrib_reg), key);
+	key = XXH3_64bits_withSeed(&metadata.vertex_buffer_reg, sizeof(metadata.vertex_buffer_reg), key);
+	if (metadata.input_semantics.data() != nullptr && !metadata.input_semantics.empty()) {
+		key = XXH3_64bits_withSeed(metadata.input_semantics.data(),
+		                           metadata.input_semantics.size_bytes(), key);
+	}
+	if (attrib != nullptr && buffer != nullptr) {
+		key = XXH3_64bits_withSeed(attrib, ShaderVertexInputInfo::RES_MAX * sizeof(uint32_t), key);
+		key = XXH3_64bits_withSeed(buffer, ShaderVertexInputInfo::RES_MAX * 4 * sizeof(uint32_t),
+		                           key);
+	}
+	auto& entry = cache[key & (kCacheSize - 1)];
+	if (entry.valid && entry.key == key) {
+		const auto& src             = entry.info;
+		info.pa_cl_vs_out_cntl      = src.pa_cl_vs_out_cntl;
+		info.scratch_size_dwords    = src.scratch_size_dwords;
+		info.has_dynamic_vertex_fetch = src.has_dynamic_vertex_fetch;
+		info.fetch_attrib_reg       = src.fetch_attrib_reg;
+		info.fetch_buffer_reg       = src.fetch_buffer_reg;
+		info.resources_num          = src.resources_num;
+		info.buffers_num            = src.buffers_num;
+		std::copy_n(src.resources, ShaderVertexInputInfo::RES_MAX, info.resources);
+		std::copy_n(src.resources_dst, ShaderVertexInputInfo::RES_MAX, info.resources_dst);
+		std::copy_n(src.buffers, ShaderVertexInputInfo::RES_MAX, info.buffers);
+		return true;
+	}
+
+	if (attrib != nullptr && buffer != nullptr) {
 		// The attribute and buffer tables are cold in the CPU cache on the first draw that uses
 		// them, so decode them with memory-level parallelism inside ShaderApplyAttribSemantics.
 		ShaderApplyAttribSemantics(info, metadata.input_semantics, attrib, buffer);
 		ShaderDetectBuffers(info);
 	}
+	entry.key   = key;
+	entry.info  = info;
+	entry.valid = true;
 	return true;
 }
 

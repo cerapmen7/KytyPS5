@@ -37,6 +37,7 @@
 #include <atomic>
 #include <bit>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -44,6 +45,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -599,6 +601,187 @@ struct DrawIndexBufferSource {
 	uint32_t    guest_element_size = 0;
 };
 
+static std::optional<DrawEmitInfo> ResolveDrawEmit(const HW::UserConfig&        ucfg,
+                                                   const ShaderVertexInputInfo& vs,
+                                                   DrawOffsetSource             source,
+                                                   int32_t                      first_vertex,
+                                                   uint32_t                     first_instance,
+                                                   const DrawIndirectArgs&      indirect);
+
+static bool AsyncDrawPrepRequested() {
+	static const bool enabled = [] {
+		const auto* const value = std::getenv("KYTY_ASYNC_PREP");
+		return value != nullptr && *value != '\0' && std::strtoul(value, nullptr, 10) != 0;
+	}();
+	return enabled;
+}
+
+// One draw whose shader stages are prepared on a worker while the GPU thread records the
+// previous draw. The register and shader state are copied at capture, so later register
+// packets cannot change what this draw records.
+class DrawPrepQueue {
+public:
+	explicit DrawPrepQueue(RenderExecutor& executor): m_executor(executor) {
+		m_thread = std::jthread([this](std::stop_token stop) { Run(stop); });
+	}
+	~DrawPrepQueue() {
+		{
+			std::lock_guard lock(m_mutex);
+			m_stop = true;
+		}
+		m_cv.notify_all();
+	}
+	KYTY_CLASS_NO_COPY(DrawPrepQueue);
+
+	void SubmitIndex(CommandBuffer& buffer, const DrawCallInfo& draw, const DrawIndexArgs& args,
+	                 DrawRenderState&& state, const DrawIndexBufferSource& index_source,
+	                 std::vector<uint16_t>&& expanded) {
+		Flush(buffer);
+		Capture(buffer, draw, state, index_source, std::move(expanded));
+		m_pending.indexed = true;
+		m_pending.index_args = args;
+		StartOrRecord(buffer);
+	}
+	void SubmitAuto(CommandBuffer& buffer, const DrawCallInfo& draw, const DrawAutoArgs& args,
+	                DrawRenderState&& state, const DrawIndexBufferSource& index_source,
+	                std::vector<uint16_t>&& expanded) {
+		Flush(buffer);
+		Capture(buffer, draw, state, index_source, std::move(expanded));
+		m_pending.indexed = false;
+		m_pending.auto_args = args;
+		StartOrRecord(buffer);
+	}
+	[[nodiscard]] bool Pending() const noexcept { return m_pending.has; }
+
+	void Flush(CommandBuffer& buffer) {
+		if (!m_pending.has) {
+			return;
+		}
+		bool async_ok = false;
+		{
+			std::unique_lock lock(m_mutex);
+			if (m_job_pending) {
+				m_cv.wait(lock, [this] { return m_job_done || m_stop; });
+				async_ok    = m_async_ok;
+				m_job_pending = false;
+			}
+		}
+		Record(buffer, async_ok);
+		m_pending.has = false;
+	}
+
+private:
+	struct PendingDraw {
+		HW::Context              registers;
+		HW::UserConfig           user_config;
+		HW::Shader               shaders;
+		DrawCallInfo             draw;
+		DrawIndexArgs            index_args;
+		DrawAutoArgs             auto_args;
+		DrawRenderState          state;
+		DrawIndexBufferSource    index_source;
+		std::vector<uint16_t>    expanded;
+		bool                     has     = false;
+		bool                     indexed = true;
+	};
+
+	static bool AsyncEnabled() { return AsyncDrawPrepRequested(); }
+
+	void Capture(CommandBuffer& buffer, const DrawCallInfo& draw, DrawRenderState& state,
+	             const DrawIndexBufferSource& index_source, std::vector<uint16_t>&& expanded) {
+		m_pending.registers   = buffer.GetRegisters();
+		m_pending.user_config = buffer.GetUserConfig();
+		m_pending.shaders     = buffer.GetShaders();
+		m_pending.draw        = draw;
+		m_pending.state       = std::move(state);
+		m_pending.index_source = index_source;
+		m_pending.expanded    = std::move(expanded);
+		if (!m_pending.expanded.empty()) {
+			m_pending.index_source.host_data = m_pending.expanded.data();
+		}
+		m_pending.has = true;
+	}
+	void StartOrRecord(CommandBuffer& buffer) {
+		if (!AsyncEnabled()) {
+			Record(buffer, false);
+			m_pending.has = false;
+			return;
+		}
+		{
+			std::lock_guard lock(m_mutex);
+			m_job_done    = false;
+			m_async_ok    = false;
+			m_job_pending = true;
+		}
+		m_cv.notify_all();
+	}
+	void Record(CommandBuffer& buffer, bool programs_ready) {
+		auto* saved_registers   = buffer.m_registers;
+		auto* saved_user_config = buffer.m_user_config;
+		auto* saved_shaders     = buffer.m_shaders;
+		buffer.m_registers      = &m_pending.registers;
+		buffer.m_user_config    = &m_pending.user_config;
+		buffer.m_shaders        = &m_pending.shaders;
+		const bool ok = m_executor.CompleteDraw(buffer, m_pending.draw, m_pending.state,
+		                                        programs_ready);
+		if (ok) {
+			const auto emit = m_pending.indexed
+			                      ? ResolveDrawEmit(m_pending.user_config,
+			                                        m_pending.state.vertex_info[0],
+			                                        m_pending.index_args.offset_source,
+			                                        m_pending.index_args.base_vertex,
+			                                        m_pending.index_args.first_instance,
+			                                        m_pending.index_args.indirect)
+			                      : ResolveDrawEmit(m_pending.user_config,
+			                                        m_pending.state.vertex_info[0],
+			                                        m_pending.auto_args.offset_source,
+			                                        static_cast<int32_t>(m_pending.auto_args.first_vertex),
+			                                        m_pending.auto_args.first_instance,
+			                                        m_pending.auto_args.indirect);
+			if (emit) {
+				m_executor.ExecutePreparedDraw(buffer, m_pending.draw, m_pending.state, *emit,
+				                               m_pending.index_source);
+			}
+		}
+		m_executor.ResetBindings();
+		buffer.m_registers   = saved_registers;
+		buffer.m_user_config = saved_user_config;
+		buffer.m_shaders     = saved_shaders;
+	}
+	void Run(std::stop_token stop) {
+		for (;;) {
+			{
+				std::unique_lock lock(m_mutex);
+				m_cv.wait(lock, [this, &stop] {
+					return m_stop || stop.stop_requested() || (m_job_pending && !m_job_done);
+				});
+				if (m_stop || stop.stop_requested()) {
+					return;
+				}
+			}
+			const bool ok = m_executor.m_context.GetPipelineCache().GetGraphicsPrograms(
+			    m_pending.registers, m_pending.user_config, m_pending.shaders, m_pending.state,
+			    true);
+			{
+				std::lock_guard lock(m_mutex);
+				m_async_ok = ok;
+				m_job_done = true;
+			}
+			m_cv.notify_all();
+		}
+	}
+
+	RenderExecutor&          m_executor;
+	PendingDraw              m_pending;
+	std::mutex               m_mutex;
+	std::condition_variable  m_cv;
+	bool                     m_job_pending = false;
+	bool                     m_job_done    = false;
+	bool                     m_async_ok    = false;
+	bool                     m_stop        = false;
+	std::jthread             m_thread;
+};
+
 // The task shader's inputs for an indirect mesh draw: Params in gpu_mesh_indirect.task.
 struct MeshTaskParams {
 	vk::DeviceAddress records        = 0;
@@ -892,6 +1075,27 @@ bool RenderExecutor::ShouldSkipDepthOnly(const CommandBuffer& buffer) const {
 	return SkipDepthOnlyEnabled() && IsDepthOnlyDraw(buffer);
 }
 
+DrawPrepQueue& RenderExecutor::GetDrawPrep() {
+	if (!m_draw_prep) {
+		m_draw_prep = std::make_shared<DrawPrepQueue>(*this);
+	}
+	return *m_draw_prep;
+}
+
+void RenderExecutor::FlushPendingDraw() {
+	if (!m_draw_prep || !m_draw_prep->Pending()) {
+		return;
+	}
+	auto& scheduler = m_context.GetCommandScheduler();
+	if (scheduler.Active()) {
+		m_draw_prep->Flush(scheduler.Current());
+	}
+}
+
+bool RenderExecutor::HasPendingDraw() const {
+	return m_draw_prep && m_draw_prep->Pending();
+}
+
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             DrawRenderState& state) {
 	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Programs);
@@ -901,9 +1105,53 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	}
 	m_context.GetImageHeap().BeginDraw();
 	m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
+	return FinalizeDrawRenderState(buffer, draw, state);
+}
+
+bool RenderExecutor::CompleteDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
+                                  DrawRenderState& state, bool programs_ready) {
+	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Programs);
+	if (SkipDepthOnlyEnabled() && IsDepthOnlyDraw(buffer)) {
+		Common::PerfProbe::Add(Common::PerfProbe::Slot::DepthOnlyDraw, 0);
+		return false;
+	}
+	if (programs_ready) {
+		bool valid = state.vertex_info[0].stage.module != nullptr;
+		for (const auto& vertex: state.VertexStages()) {
+			valid = valid && vertex.stage.module != nullptr && vertex.stage.resources != nullptr;
+		}
+		if (state.ps_active) {
+			valid = valid && state.ps_input_info.stage.module != nullptr &&
+			        state.ps_input_info.stage.resources != nullptr;
+		}
+		if (!valid) {
+			programs_ready = false;
+		}
+	}
+	m_context.GetImageHeap().BeginDraw();
+	if (!programs_ready) {
+		m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
+	}
+	if (state.ps_active && !state.ps_input_info.stage) {
+		EXIT("CompleteDraw: ps_active with empty stage, programs_ready=%d", programs_ready ? 1 : 0);
+	}
+	if (!state.vertex_info[0].stage) {
+		EXIT("CompleteDraw: empty VS stage, programs_ready=%d", programs_ready ? 1 : 0);
+	}
+	return FinalizeDrawRenderState(buffer, draw, state);
+}
+
+bool RenderExecutor::FinalizeDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
+                                             DrawRenderState& state) {
 	// Vertex programs beyond the host mesh limits or with unsupported call targets are not
 	// compiled.
 	if (state.vertex_info[0].stage.module == nullptr) {
+		return false;
+	}
+	if (!draw.indexed && Prospero::IsRectList(buffer.GetUserConfig().GetPrimType()) &&
+	    state.vertex_info[0].buffers_num == 0 &&
+	    state.vertex_info[0].stage.module->info.param_export_mask == 0 &&
+	    state.ps_input_info.input_num != 0) {
 		return false;
 	}
 	// An empty screen scissor rasterizes nothing in any viewport, so only vertex-stage buffer
@@ -994,20 +1242,19 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 	return prepared;
 }
 
-static void CommitVertexBuffers(vk::CommandBuffer            vk_buffer,
-                                const PreparedVertexBuffers& prepared) {
+static void CommitVertexBuffers(CommandBuffer& buffer, const PreparedVertexBuffers& prepared) {
 	if (prepared.count != 0) {
 		// Guest descriptor bounds must survive allocation merging in the cache.
-		vk_buffer.bindVertexBuffers2(0, prepared.count, prepared.buffers.data(),
-		                             prepared.offsets.data(), prepared.sizes.data(), nullptr);
+		buffer.BindVertexBuffersCached(prepared.count, prepared.buffers.data(),
+		                               prepared.offsets.data(), prepared.sizes.data());
 	}
 }
 
-static void CommitIndexBuffer(vk::CommandBuffer vk_buffer, const PreparedIndexBuffer& prepared) {
+static void CommitIndexBuffer(CommandBuffer& buffer, const PreparedIndexBuffer& prepared) {
 	if (prepared.buffer == nullptr) {
 		return;
 	}
-	vk_buffer.bindIndexBuffer(prepared.buffer, prepared.offset, prepared.type);
+	buffer.BindIndexBufferCached(prepared.buffer, prepared.offset, prepared.type);
 }
 
 static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo& draw,
@@ -1188,10 +1435,17 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	{
 		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Bindings);
 		for (uint32_t i = 0; i < vertex_stages.size(); i++) {
+			if (!state.vertex_info[i].stage) {
+				EXIT("draw VS stage %u is empty (indexed=%d ps_active=%d)", i,
+				     draw.indexed ? 1 : 0, state.ps_active ? 1 : 0);
+			}
 			PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
 			descriptor_stages[stage_count++] = &bindings.vertex[i];
 		}
 		if (state.ps_active) {
+			if (!state.ps_input_info.stage) {
+				EXIT("draw PS stage is empty (indexed=%d)", draw.indexed ? 1 : 0);
+			}
 			PrepareBindings(state.ps_input_info.stage, bindings.pixel);
 			descriptor_stages[stage_count++] = &bindings.pixel;
 		}
@@ -1254,14 +1508,14 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	// memory.
 	auto vk_buffer = buffer.Handle();
 	if (!mesh_active) {
-		CommitVertexBuffers(vk_buffer, vertex_bindings);
+		CommitVertexBuffers(buffer, vertex_bindings);
 	}
 	{
 		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::CommitBindings);
 		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
 	}
 	if (!mesh_active) {
-		CommitIndexBuffer(vk_buffer, index_binding);
+		CommitIndexBuffer(buffer, index_binding);
 	}
 	using ShaderRecompiler::IR::PushData;
 	const auto draw_dwords =
@@ -1322,7 +1576,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	{
 		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::DrawCall);
 		buffer.BeginRendering(rendering);
-		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+		buffer.BindPipelineCached(pipeline.pipeline);
 		auto&         occlusion_queries = m_context.GetOcclusionQueries();
 		const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
 		if (mesh_task) {
@@ -1402,6 +1656,7 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 		return true;
 	}
 	m_context.GetCommandScheduler().PopPendingOperations();
+	FlushPendingDraw();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -1479,19 +1734,24 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 
 	const DrawCallInfo draw {true, args.index_count, args.instance_count};
 	prefix.Stop();
-	if (!PrepareDrawRenderState(buffer, draw, state)) {
+	if (!AsyncDrawPrepRequested()) {
+		if (!PrepareDrawRenderState(buffer, draw, state)) {
+			ResetBindings();
+			return true;
+		}
+		LogDrawStateIfNeeded(buffer, draw, state, m_targets, args.index_type_and_size,
+		                     args.index_addr);
+		const auto emit = ResolveDrawEmit(ucfg, state.vertex_info[0], args.offset_source,
+		                                  args.base_vertex, args.first_instance, args.indirect);
+		if (emit) {
+			ExecutePreparedDraw(buffer, draw, state, *emit, index_source);
+		}
 		ResetBindings();
-		return true;
+		return emit.has_value();
 	}
-
-	LogDrawStateIfNeeded(buffer, draw, state, m_targets, args.index_type_and_size, args.index_addr);
-	const auto emit = ResolveDrawEmit(ucfg, state.vertex_info[0], args.offset_source,
-	                                  args.base_vertex, args.first_instance, args.indirect);
-	if (emit) {
-		ExecutePreparedDraw(buffer, draw, state, *emit, index_source);
-	}
-	ResetBindings();
-	return emit.has_value();
+	GetDrawPrep().SubmitIndex(buffer, draw, args, std::move(state), index_source,
+	                          std::move(expanded_indices));
+	return true;
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -1506,6 +1766,7 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 		return true;
 	}
 	m_context.GetCommandScheduler().PopPendingOperations();
+	FlushPendingDraw();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -1555,34 +1816,30 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 		ResetBindings();
 		return true;
 	}
-	if (!PrepareDrawRenderState(buffer, draw, state)) {
-		ResetBindings();
-		return true;
-	}
-
-	const bool rect_list = Prospero::IsRectList(ucfg.GetPrimType());
-	if (rect_list && state.vertex_info[0].buffers_num == 0 &&
-	    state.vertex_info[0].stage.module->info.param_export_mask == 0 &&
-	    state.ps_input_info.input_num != 0) {
-		if (graphics_debug_dump_enabled()) {
-			LOGF("DrawIndexAuto: skipping rect-list draw with no VS param exports and PS inputs: "
-			     "ps_inputs=%u ps=0x%016" PRIx64 " es=0x%016" PRIx64 " gs=0x%016" PRIx64 "\n",
-			     state.ps_input_info.input_num, sh_ctx.GetPs().ps_regs.data_addr,
-			     sh_ctx.GetVs().es_regs.data_addr, sh_ctx.GetVs().gs_regs.data_addr);
+	if (!AsyncDrawPrepRequested()) {
+		if (!PrepareDrawRenderState(buffer, draw, state)) {
+			ResetBindings();
+			return true;
+		}
+		const bool rect_list = Prospero::IsRectList(ucfg.GetPrimType());
+		if (rect_list && state.vertex_info[0].buffers_num == 0 &&
+		    state.vertex_info[0].stage.module->info.param_export_mask == 0 &&
+		    state.ps_input_info.input_num != 0) {
+			ResetBindings();
+			return true;
+		}
+		LogDrawStateIfNeeded(buffer, draw, state, m_targets, 0, nullptr);
+		const auto emit = ResolveDrawEmit(ucfg, state.vertex_info[0], args.offset_source,
+		                                  static_cast<int32_t>(args.first_vertex),
+		                                  args.first_instance, args.indirect);
+		if (emit) {
+			ExecutePreparedDraw(buffer, draw, state, *emit, {});
 		}
 		ResetBindings();
-		return true;
+		return emit.has_value();
 	}
-
-	LogDrawStateIfNeeded(buffer, draw, state, m_targets, 0, nullptr);
-	const auto emit = ResolveDrawEmit(ucfg, state.vertex_info[0], args.offset_source,
-	                                  static_cast<int32_t>(args.first_vertex), args.first_instance,
-	                                  args.indirect);
-	if (emit) {
-		ExecutePreparedDraw(buffer, draw, state, *emit, {});
-	}
-	ResetBindings();
-	return emit.has_value();
+	GetDrawPrep().SubmitAuto(buffer, draw, args, std::move(state), {}, {});
+	return true;
 }
 
 bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer) {

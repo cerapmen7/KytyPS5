@@ -102,6 +102,9 @@ public:
 	void               QueueBdaSync(uint64_t vaddr, uint64_t size, bool is_write = false);
 	void               RunGarbageCollector();
 	void               PublishReadHot();
+	// Defers the proactive publish across end-of-slice flushes. Guest reads still download
+	// their range on demand, and a frame boundary publishes everything that is left.
+	void               PublishReadHotCoalesced();
 	void               DecayReadHot();
 	void               SupersedeAllPublishes();
 	void               SupersedePublishes(uint64_t vaddr, uint64_t size);
@@ -240,6 +243,7 @@ private:
 	RangeSet                                          m_publish_ranges;
 	std::vector<std::shared_ptr<PublishBatch>>        m_inflight_publishes;
 	uint64_t                                          m_hot_flip = 0;
+	uint32_t                                          m_publish_slices = 0;
 };
 
 } // namespace Libs::Graphics

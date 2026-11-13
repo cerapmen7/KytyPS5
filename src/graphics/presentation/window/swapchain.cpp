@@ -397,7 +397,9 @@ void Swapchain::Create() {
 		    std::clamp(m_window_extent.height, surface.capabilities.minImageExtent.height,
 		               surface.capabilities.maxImageExtent.height);
 	}
-	uint32_t image_count = surface.capabilities.minImageCount + 1;
+	// A deeper swapchain lets the GPU keep earlier frames in flight while the CPU records
+	// the next one; the default +1 only gives the minimum triple buffering.
+	uint32_t image_count = surface.capabilities.minImageCount + 3;
 	if (surface.capabilities.maxImageCount != 0) {
 		image_count = std::min(image_count, surface.capabilities.maxImageCount);
 	}

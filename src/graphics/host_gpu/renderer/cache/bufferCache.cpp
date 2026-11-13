@@ -43,10 +43,10 @@ constexpr uint64_t DefaultDownloadWindowSize = 512 * 1024;
 // Packed download ranges start on their own cache line, as in shadPS4.
 constexpr uint64_t DownloadCopyAlignment = 64;
 
-constexpr uint64_t DefaultHotFlips      = 8;
-constexpr size_t   DefaultHotPagesMax   = 1024;
+constexpr uint64_t DefaultHotFlips      = 16;
+constexpr size_t   DefaultHotPagesMax   = 8192;
 constexpr uint64_t HotNotePages         = 16;
-constexpr uint64_t DefaultPublishBudget = 1 * MiB;
+constexpr uint64_t DefaultPublishBudget = 2 * MiB;
 
 void RecordDownloadCopies(vk::CommandBuffer native, const Buffer& source, const Buffer& target,
                           std::span<const vk::BufferCopy> copies, uint64_t offset, uint64_t size) {
@@ -509,8 +509,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream,
-                      LabEnv("KYTY_STREAM_MB", 64) * MiB),
-      m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
+                      LabEnv("KYTY_STREAM_MB", 256) * MiB),
+      m_download_buffer(graphics, scheduler, MemoryUsage::Download, 256 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache), m_batch_hot_readbacks(Config::BatchHotReadbacksEnabled()) {
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
@@ -622,8 +622,28 @@ void BufferCache::NoteReadHot(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+void BufferCache::PublishReadHotCoalesced() {
+	static const uint32_t interval = [] {
+		const auto* const value = std::getenv("KYTY_PUBLISH_SLICES");
+		if (value == nullptr || *value == '\0') {
+			return 1u;
+		}
+		return static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+	}();
+	if (interval <= 1) {
+		PublishReadHot();
+		return;
+	}
+	if (++m_publish_slices < interval) {
+		return;
+	}
+	m_publish_slices = 0;
+	PublishReadHot();
+}
+
 void BufferCache::DecayReadHot() {
 	m_hot_flip++;
+	m_publish_slices = 0;
 	const auto hot_flips = LabEnv("KYTY_HOT_FLIPS", DefaultHotFlips);
 	std::erase_if(m_hot_pages, [this, hot_flips](const auto& page) {
 		if (m_hot_flip - page.second <= hot_flips) {
@@ -658,6 +678,7 @@ void BufferCache::PublishReadHot() {
 	if (m_publish_ranges.Empty()) {
 		return;
 	}
+	Common::PerfProbe::Scope publish_probe(Common::PerfProbe::Slot::PublishHot);
 	struct Target {
 		uint64_t vaddr;
 		uint64_t offset;
@@ -1031,12 +1052,15 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	}
 	// A copy into whole levels of a GPU-written image lands on its GPU contents, not stale guest
 	// bytes, while no buffer holds the range.
-	if (src_memory && dst_memory && !IsRegionRegistered(dst_vaddr, size) &&
+	if (src_memory && dst_memory && m_texture_cache.MayContainImage(dst_vaddr, size) &&
+	    !IsRegionRegistered(dst_vaddr, size) &&
 	    m_texture_cache.CopyToImage(dst_vaddr, src_vaddr, size)) {
 		return;
 	}
 	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
-	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
+	    !IsRegionGpuModified(src_vaddr, size) &&
+	    (!m_texture_cache.MayContainImage(src_vaddr, size) ||
+	     !m_texture_cache.FindImageFromRange(src_vaddr, size))) {
 		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
 		            size);
 		return;

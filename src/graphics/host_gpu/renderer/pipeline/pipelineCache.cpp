@@ -343,6 +343,7 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	    .function_code  = {function_code.begin(), function_code.end()},
 	});
 	UpdateShaderModuleDescriptorBuffers(module);
+	m_heap_shaders[{key.stage, key.hash}] = module.info.info.uses_image_heap;
 	m_compiled[static_cast<size_t>(key.stage)]++;
 	// Guest geometry shaders are compiled through the host mesh stage.
 	std::printf("Shaders: VS %u | PS %u | CS %u | GS %u | LS %u | HS %u | TES %u\n",
@@ -371,7 +372,7 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 
 template <typename InputInfo>
 const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputInfo& input_info,
-                                              uint32_t& push_data_cursor) {
+                                              uint32_t& push_data_cursor, bool allow_compile) {
 	const auto user_data = std::span(params.user_data).first(params.user_data_count);
 	ShaderRecompiler::IR::SrtRuntime runtime {
 	    .user_data                  = user_data,
@@ -429,6 +430,9 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			module = cached.template FindModule<false>(runtime, push_data_cursor);
 		}
 		if (module != nullptr) return bind(*module);
+	}
+	if (!allow_compile) {
+		return nullptr;
 	}
 
 	options.shader_hash     = params.hash;
@@ -666,12 +670,25 @@ void PipelineCache::WriteDriverCache() const {
 }
 
 void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state) {
+	(void)GetGraphicsPrograms(command.GetRegisters(), command.GetUserConfig(), command.GetShaders(),
+	                          state, false);
+}
+
+bool PipelineCache::UsesImageHeap(ShaderType stage, uint64_t hash) const {
+	std::lock_guard lock(m_program_mutex);
+	const auto      found = m_heap_shaders.find({stage, hash});
+	// An unknown shader may need the heap; only a compiled module proves it does not.
+	return found == m_heap_shaders.end() || found->second;
+}
+
+bool PipelineCache::GetGraphicsPrograms(const HW::Context& context,
+                                        const HW::UserConfig& user_config,
+                                        const HW::Shader& shaders, DrawRenderState& state,
+                                        bool allow_async) {
 	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::GraphicsPrograms);
-	const auto& context           = command.GetRegisters();
-	const auto& user_config       = command.GetUserConfig();
 	const auto& sh                = context.GetShaderRegisters();
-	const auto& vertex_regs       = command.GetShaders().GetVs();
-	const auto& pixel_regs        = command.GetShaders().GetPs();
+	const auto& vertex_regs       = shaders.GetVs();
+	const auto& pixel_regs        = shaders.GetPs();
 	auto&       vertex_info       = state.vertex_info;
 	auto&       pixel_info        = state.ps_input_info;
 	const bool  object_primitive_id = context.HasObjectPrimitiveIdOutput();
@@ -750,7 +767,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 				    "Warning: dropping mesh draws the host does not support (shader 0x{:016x}).\n",
 				    vertex_params[0].hash));
 			}
-			return;
+			return false;
 		}
 		// A task shader launches each record's groups and passes its draw parameters in a
 		// payload beside the LDS, the allocation pair and the Layer array; without room for
@@ -874,8 +891,19 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	}
 	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
 	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
+	if (allow_async && (tess_active || mesh_active)) {
+		return false;
+	}
+	if (allow_async && pixel_active && UsesImageHeap(ShaderType::Pixel, pixel_params.hash)) {
+		return false;
+	}
 	if (pixel_active) {
-		const auto& pixel_module = *GetProgram(pixel_params, pixel_info, push_data_cursor);
+		const auto* pixel_program =
+		    GetProgram(pixel_params, pixel_info, push_data_cursor, !allow_async);
+		if (pixel_program == nullptr) {
+			return false;
+		}
+		const auto& pixel_module = *pixel_program;
 		for (const auto& output: pixel_module.info.info.outputs) {
 			if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt ||
 			    output.kind == ShaderRecompiler::IR::StageOutputKind::ObjectPrimitiveId) {
@@ -885,8 +913,17 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		state.mrt_mask &= color_output_mask;
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
-		GetProgram(vertex_params[i], vertex_info[i], push_data_cursor);
+		if (allow_async && UsesImageHeap(vertex_info[i].logical_stage, vertex_params[i].hash)) {
+			return false;
+		}
 	}
+	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
+		if (GetProgram(vertex_params[i], vertex_info[i], push_data_cursor, !allow_async) ==
+		    nullptr) {
+			return false;
+		}
+	}
+	return true;
 }
 
 const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
@@ -940,6 +977,7 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 	// different counts must re-run the resolution. m_lookup_key still holds its key.
 	bool counts_dependent = false;
 	if (module != nullptr) {
+		std::lock_guard lock(m_program_mutex);
 		if (const auto entry = m_program_cache.find(m_lookup_key);
 		    entry != m_program_cache.end()) {
 			for (const auto& source: entry->second.resource_plan.descriptor_sources) {

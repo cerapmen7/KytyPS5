@@ -245,6 +245,8 @@ bool PipelineCache::LoadRecord(std::span<const uint8_t>& records) {
 				return false;
 			}
 			module.module = CompileSPV(spirv, m_graphics.device);
+			m_heap_shaders[{program->first.stage, program->first.hash}] =
+			    module.info.info.uses_image_heap;
 			program->second.modules.push_back(std::move(module));
 			break;
 		}
