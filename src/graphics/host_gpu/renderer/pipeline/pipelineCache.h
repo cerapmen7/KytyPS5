@@ -22,6 +22,7 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <shared_mutex>
 #include <span>
 #include <thread>
 #include <type_traits>
@@ -165,6 +166,13 @@ struct DrawRenderState {
 	}
 };
 
+// Job-owned resource snapshots. Worker preparation writes here instead of the shared
+// Program.resources, so recording a draw cannot race a later draw with the same program.
+struct GraphicsPreparedResources {
+	std::array<ShaderRecompiler::IR::ResourceSnapshot, 3> vertex;
+	ShaderRecompiler::IR::ResourceSnapshot                pixel;
+};
+
 // Writes the shader store on its own thread, running jobs in the order they were posted.
 class ShaderStoreWriter {
 public:
@@ -218,7 +226,8 @@ public:
 	// Returns false without touching the image heap when the shaders need it or are not
 	// known yet; the caller then runs the synchronous path.
 	bool GetGraphicsPrograms(const HW::Context& context, const HW::UserConfig& user_config,
-	                         const HW::Shader& shaders, DrawRenderState& state, bool allow_async);
+	                         const HW::Shader& shaders, DrawRenderState& state, bool allow_async,
+	                         GraphicsPreparedResources* prepared = nullptr);
 	[[nodiscard]] bool UsesImageHeap(ShaderType stage, uint64_t hash) const;
 	// Null skips the dispatch.
 	const ShaderModule* GetComputeProgram(const HW::ComputeShaderInfo& regs,
@@ -275,11 +284,13 @@ private:
 	ShaderRecompiler::IR::ImageHeapSource* m_image_heap;
 	std::unordered_map<ProgramKey, Program, ProgramKeyHash> m_program_cache;
 	// Serializes program preparation between the GPU thread and its draw-preparation worker.
-	mutable std::mutex m_program_mutex;
+	mutable std::shared_mutex m_program_mutex;
 	mutable std::map<std::pair<ShaderType, uint64_t>, bool> m_heap_shaders;
+	// Serializes MaterializeResources for one program without serializing different programs.
+	mutable std::array<std::mutex, 64> m_prepare_stripes {};
 	// Modules compiled per stage.
 	std::array<uint32_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> m_compiled {};
-	ProgramKey                             m_lookup_key;
+	static thread_local ProgramKey         m_lookup_key;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
@@ -293,6 +304,10 @@ private:
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
 	                               uint32_t& push_data_cursor, bool allow_compile = true);
+	template <typename InputInfo>
+	const ShaderModule* GetPreparedProgram(const ShaderParams& params, InputInfo& input_info,
+	                                       uint32_t&                       push_data_cursor,
+	                                       ShaderRecompiler::IR::ResourceSnapshot& resources);
 	ShaderModule& CompileModule(Program& program, const ProgramKey& key,
 	                            ShaderRecompiler::CompileOptions  options,
 	                            ShaderRecompiler::TranslateResult translated,

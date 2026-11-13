@@ -42,6 +42,8 @@
 
 namespace Libs::Graphics {
 
+thread_local PipelineCache::ProgramKey PipelineCache::m_lookup_key;
+
 namespace {
 
 constexpr auto DriverCacheSaveInterval = std::chrono::minutes {1};
@@ -373,6 +375,7 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 template <typename InputInfo>
 const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputInfo& input_info,
                                               uint32_t& push_data_cursor, bool allow_compile) {
+	std::unique_lock lock(m_program_mutex);
 	const auto user_data = std::span(params.user_data).first(params.user_data_count);
 	ShaderRecompiler::IR::SrtRuntime runtime {
 	    .user_data                  = user_data,
@@ -485,6 +488,66 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	}
 	return bind(CompileModule(entry->second, entry->first, options, std::move(translated),
 	                          push_data_cursor));
+}
+
+template <typename InputInfo>
+const ShaderModule* PipelineCache::GetPreparedProgram(
+    const ShaderParams& params, InputInfo& input_info, uint32_t& push_data_cursor,
+    ShaderRecompiler::IR::ResourceSnapshot& resources) {
+	std::shared_lock cache_lock(m_program_mutex);
+	std::lock_guard  prepare_lock(m_prepare_stripes[params.hash & 63u]);
+	const auto       user_data = std::span(params.user_data).first(params.user_data_count);
+	ShaderRecompiler::IR::SrtRuntime runtime {
+	    .user_data                  = user_data,
+	    .shader_base                = params.Base(),
+	    .read_specialization_memory = ReadShaderGuestMemory,
+	    .image_heap                 = m_image_heap,
+	};
+	ShaderRecompiler::CompileOptions options {.wave_size = input_info.wave_size};
+	if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+		options.stage          = input_info.logical_stage;
+		options.user_data_base = 8;
+		if (options.stage == ShaderType::Mesh ||
+		    options.stage == ShaderType::TessellationControl) {
+			options.user_data_base = 0;
+		}
+		if (options.stage == ShaderType::Mesh) {
+			options.wave_size = input_info.mesh.wave_size;
+		}
+	} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+		options.stage = ShaderType::Pixel;
+	} else {
+		return nullptr;
+	}
+	m_lookup_key.stage           = options.stage;
+	m_lookup_key.hash            = params.hash;
+	m_lookup_key.user_data_count = params.user_data_count;
+	BuildStageStaticKey(input_info, m_lookup_key.static_state);
+	const auto entry = m_program_cache.find(m_lookup_key);
+	if (entry == m_program_cache.end()) {
+		return nullptr;
+	}
+	const auto& program = entry->second;
+	if (program.call_source != nullptr || program.skip_dispatch) {
+		return nullptr;
+	}
+	ShaderRecompiler::IR::ResourceSpecialization specialization;
+	if (!ShaderRecompiler::IR::MaterializeResources(program.resource_plan, runtime, resources,
+	                                                specialization)) {
+		return nullptr;
+	}
+	for (const auto& candidate: program.modules) {
+		const auto& layout = candidate.info.bindings;
+		if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
+		        push_data_cursor, layout.ShaderDataDwords()) ||
+		    candidate.specialization != specialization) {
+			continue;
+		}
+		input_info.stage = {.module = &candidate, .resources = &resources};
+		candidate.info.bindings.AdvancePushData(push_data_cursor);
+		return &candidate;
+	}
+	return nullptr;
 }
 
 PipelineCache::PipelineCache(GraphicContext&                         graphics,
@@ -675,7 +738,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 }
 
 bool PipelineCache::UsesImageHeap(ShaderType stage, uint64_t hash) const {
-	std::lock_guard lock(m_program_mutex);
+	std::shared_lock lock(m_program_mutex);
 	const auto      found = m_heap_shaders.find({stage, hash});
 	// An unknown shader may need the heap; only a compiled module proves it does not.
 	return found == m_heap_shaders.end() || found->second;
@@ -684,8 +747,11 @@ bool PipelineCache::UsesImageHeap(ShaderType stage, uint64_t hash) const {
 bool PipelineCache::GetGraphicsPrograms(const HW::Context& context,
                                         const HW::UserConfig& user_config,
                                         const HW::Shader& shaders, DrawRenderState& state,
-                                        bool allow_async) {
+                                        bool allow_async, GraphicsPreparedResources* prepared) {
 	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::GraphicsPrograms);
+	if (allow_async && prepared == nullptr) {
+		return false;
+	}
 	const auto& sh                = context.GetShaderRegisters();
 	const auto& vertex_regs       = shaders.GetVs();
 	const auto& pixel_regs        = shaders.GetPs();
@@ -899,7 +965,9 @@ bool PipelineCache::GetGraphicsPrograms(const HW::Context& context,
 	}
 	if (pixel_active) {
 		const auto* pixel_program =
-		    GetProgram(pixel_params, pixel_info, push_data_cursor, !allow_async);
+		    prepared != nullptr
+		        ? GetPreparedProgram(pixel_params, pixel_info, push_data_cursor, prepared->pixel)
+		        : GetProgram(pixel_params, pixel_info, push_data_cursor, !allow_async);
 		if (pixel_program == nullptr) {
 			return false;
 		}
@@ -918,8 +986,12 @@ bool PipelineCache::GetGraphicsPrograms(const HW::Context& context,
 		}
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
-		if (GetProgram(vertex_params[i], vertex_info[i], push_data_cursor, !allow_async) ==
-		    nullptr) {
+		const auto* module =
+		    prepared != nullptr
+		        ? GetPreparedProgram(vertex_params[i], vertex_info[i], push_data_cursor,
+		                             prepared->vertex[i])
+		        : GetProgram(vertex_params[i], vertex_info[i], push_data_cursor, !allow_async);
+		if (module == nullptr) {
 			return false;
 		}
 	}
@@ -977,7 +1049,7 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 	// different counts must re-run the resolution. m_lookup_key still holds its key.
 	bool counts_dependent = false;
 	if (module != nullptr) {
-		std::lock_guard lock(m_program_mutex);
+		std::shared_lock lock(m_program_mutex);
 		if (const auto entry = m_program_cache.find(m_lookup_key);
 		    entry != m_program_cache.end()) {
 			for (const auto& source: entry->second.resource_plan.descriptor_sources) {
