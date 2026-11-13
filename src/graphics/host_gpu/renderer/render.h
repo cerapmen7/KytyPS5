@@ -11,7 +11,10 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <memory>
 #include <span>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -20,6 +23,7 @@ namespace HW {
 class Context;
 class UserConfig;
 class Shader;
+struct DepthRenderTarget;
 } // namespace HW
 
 struct GraphicContext;
@@ -107,6 +111,9 @@ public:
 	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
 	[[nodiscard]] HW::UserConfig&   GetUserConfig() const noexcept { return *m_user_config; }
 	[[nodiscard]] HW::Shader&       GetShaders() const noexcept { return *m_shaders; }
+	// Hash of the PM4 packets that set up the next draw, supplied by the command processor.
+	void SetCommandHash(uint64_t hash) noexcept { m_command_hash = hash; }
+	[[nodiscard]] uint64_t GetCommandHash() const noexcept { return m_command_hash; }
 
 private:
 	explicit CommandBuffer(CommandScheduler& scheduler);
@@ -124,9 +131,10 @@ private:
 	vk::CommandBuffer   m_buffer = nullptr;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
-	HW::Context*        m_registers   = nullptr;
-	HW::UserConfig*     m_user_config = nullptr;
-	HW::Shader*         m_shaders     = nullptr;
+	HW::Context*        m_registers    = nullptr;
+	HW::UserConfig*     m_user_config  = nullptr;
+	HW::Shader*         m_shaders      = nullptr;
+	uint64_t            m_command_hash = 0;
 
 	friend class CommandScheduler;
 	friend struct CommandBufferTestAccess;
@@ -196,6 +204,8 @@ public:
 	void                           FindBuffers(std::span<PreparedBindings* const> stages);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
+	void                           NoteSampledImage(ImageId id);
+	void                           RestoreSnapshot(ImageId id);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
@@ -203,7 +213,11 @@ public:
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
 	// The PM4 front-end can drop a depth-only draw before it builds DrawIndexArgs. The executor's
 	// own check still runs, so a draw that survives this one is skipped where it was before.
-	[[nodiscard]] bool ShouldSkipDepthOnly(const CommandBuffer& buffer) const;
+	[[nodiscard]] bool ShouldSkipDepthOnly(CommandBuffer& buffer);
+	// A frame boundary for the depth-pass replay cache. Called once per guest flip, after the
+	// frame's draws were recorded. Keeps the cached shadow/depth passes only while every draw
+	// of the frame had identical inputs; otherwise the next frame is rendered from scratch.
+	void DepthCacheEndFrame();
 
 private:
 	// False, with nothing drawn, when the draw's indirect records need CPU counts.
@@ -276,6 +290,127 @@ private:
 	vk::Pipeline                          m_pssr_pipeline          = nullptr;
 	std::vector<DlssContext>              m_dlss_contexts;
 	std::array<MipStatsCounter, 256>      m_mip_stats {};
+
+	// Depth-pass replay cache. A shadow/depth pass whose every draw repeats with the same
+	// registers and the same guest buffer contents can keep the target it produced last frame.
+	// The cached pixels are therefore identical to a full re-render; a changed input falls back
+	// to rendering and refreshes the cache.
+	struct DepthCacheRange {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+		uint64_t hash    = 0;
+	};
+	struct DepthCacheImage {
+		ImageId  id      = {};
+		uint64_t version = 0;
+	};
+	struct DepthCacheDraw {
+		// Fixed storage: thousands of draws are recorded every frame, and per-draw vectors
+		// would allocate tens of thousands of small blocks and dominate the frame.
+		static constexpr uint32_t MaxRanges = 32;
+		static constexpr uint32_t MaxImages = 8;
+		uint64_t                              state_hash  = 0;
+		uint64_t                              state_ctx   = 0;
+		uint64_t                              state_cfg   = 0;
+		uint64_t                              state_shader = 0;
+		uint64_t                              state_args  = 0;
+		uint64_t                              state_line  = 0;
+		uint32_t                              range_count = 0;
+		uint32_t                              image_count = 0;
+		// A draw whose GPU-written inputs cannot be inspected is a placeholder that never
+		// matches: it renders every frame while its neighbours still replay.
+		bool                                  cacheable   = true;
+		std::array<DepthCacheRange, MaxRanges> ranges {};
+		std::array<DepthCacheImage, MaxImages> images {};
+	};
+	struct DepthCachePass {
+		uint64_t                 target_hash    = 0;
+		ImageId                  target_id      = {};
+		uint64_t                 target_version = 0;
+		std::vector<DepthCacheDraw> draws;
+		bool                     cacheable = true;
+		bool                     skipped   = false;
+		bool                     miss      = false;
+		bool                     skip_rest = false;
+	};
+
+	[[nodiscard]] bool TryReplayDepthDraw(CommandBuffer& buffer, const DrawCallInfo& draw);
+	void ReplayDepthRecordDraw(const DrawRenderState& state, const DrawEmitInfo& emit,
+	                           const DrawIndexBufferSource& index_source,
+	                           std::span<PreparedBindings* const> stages);
+	[[nodiscard]] static uint64_t DepthStateHash(const CommandBuffer& buffer,
+	                                             const DrawCallInfo& draw,
+	                                             DepthCacheDraw*    parts);
+	[[nodiscard]] static uint64_t DepthTargetHash(const HW::DepthRenderTarget& target, bool clear);
+	[[nodiscard]] uint64_t DepthRangeHash(uint64_t address, uint64_t size,
+	                                      const DepthCacheDraw* previous, uint32_t index);
+	[[nodiscard]] static bool DepthCacheEnabled();
+	[[nodiscard]] static int  DepthCacheMode();
+	[[nodiscard]] static uint64_t StaticSnapshotKey(const ImageInfo& info);
+
+	std::vector<DepthCachePass> m_depth_cache;
+	std::vector<DepthCachePass> m_depth_frame;
+	std::unordered_map<uint64_t, DepthCacheRange> m_depth_range_cache;
+	std::unordered_set<uint64_t>                  m_depth_range_dirty;
+	DepthCacheDraw               m_depth_pending {};
+	uint64_t                     m_depth_pending_hash = 0;
+	uint32_t                     m_depth_pending_pass = 0;
+	uint32_t                     m_depth_warmup       = 0;
+	uint32_t                     m_depth_frame_draws  = 0;
+	uint32_t                     m_depth_skip_count   = 0;
+	uint32_t                     m_depth_miss_count   = 0;
+	uint32_t                     m_depth_reason_state = 0;
+	uint32_t                     m_depth_reason_state_ctx = 0;
+	uint32_t                     m_depth_reason_state_cfg = 0;
+	uint32_t                     m_depth_reason_state_shader = 0;
+	uint32_t                     m_depth_reason_state_args = 0;
+	uint32_t                     m_depth_reason_state_line = 0;
+	uint32_t                     m_depth_reason_range = 0;
+	uint32_t                     m_depth_reason_target = 0;
+	uint32_t                     m_depth_reason_pass   = 0;
+	uint32_t                     m_depth_reason_meta   = 0;
+	uint32_t                     m_depth_reason_stencil = 0;
+	uint32_t                     m_depth_reason_writes  = 0;
+	uint32_t                     m_depth_reason_version = 0;
+	uint32_t                     m_depth_reason_notcacheable = 0;
+	uint32_t                     m_depth_reason_cached_invalid = 0;
+	uint32_t                     m_depth_reason_compared = 0;
+	uint32_t                     m_depth_reason_no_target = 0;
+	uint32_t                     m_depth_reason_uncacheable = 0;
+	uint64_t                     m_depth_last_shaders = 0;
+	uint64_t                     m_depth_try_ns       = 0;
+	uint64_t                     m_depth_record_ns    = 0;
+	uint64_t                     m_depth_end_ns       = 0;
+	bool                         m_depth_record       = false;
+	bool                         m_depth_cache_ready  = false;
+	bool                         m_depth_skip_rest    = false;
+	bool                         m_depth_uncacheable  = false;
+	std::vector<uint64_t>        m_depth_hash_prev;
+	std::vector<uint64_t>        m_depth_hash_current;
+	bool                         m_depth_hash_skip_disabled = false;
+	uint32_t                     m_depth_hash_skip_count = 0;
+	uint32_t                     m_depth_hash_render_count = 0;
+	// Mode 3: reuse the last fully rendered shadow/depth targets while the scene is idle.
+	bool                         m_static_skip = false;
+	bool                         m_static_input = false;
+	uint32_t                     m_static_idle = 0;
+	uint32_t                     m_static_refresh = 0;
+	uint64_t                     m_static_frame_draws = 0;
+	uint64_t                     m_static_last_shaders = 0;
+	bool                         m_static_logged = false;
+	std::vector<ImageId>         m_sampled_ids;
+	std::unordered_set<uint32_t> m_sampled_seen;
+	std::vector<std::pair<uint64_t, uint64_t>> m_sampled_ranges_prev;
+	struct StaticSnapshot {
+		uint64_t                key = 0;
+		std::shared_ptr<Image>  image;
+	};
+	std::vector<ImageId>                  m_depth_target_ids;
+	std::vector<ImageId>                  m_sampled_ids_prev;
+	std::vector<StaticSnapshot>           m_static_snapshots;
+	std::unordered_map<uint32_t, uint64_t> m_restored_versions;
+	bool                                  m_static_frame_skipped = false;
+	bool                                  m_sampled_restored = false;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

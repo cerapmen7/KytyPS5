@@ -36,6 +36,8 @@ public:
 	KYTY_CLASS_NO_COPY(OcclusionQueries);
 
 	[[nodiscard]] bool Enabled() const { return m_pool != nullptr; }
+	// A guest query is open: a replayed draw must still count its samples.
+	[[nodiscard]] bool Open() const { return m_open != 0; }
 
 	// In the draw's rendering: the query that counts its samples, or -1.
 	[[nodiscard]] int32_t Begin(vk::CommandBuffer command) {

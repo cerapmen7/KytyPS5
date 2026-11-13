@@ -1289,6 +1289,11 @@ static uint32_t SetRegisters(CommandProcessor& cp, const Table& table,
                              CommandProcessor::RegisterSpace space, uint32_t cmd_id,
                              uint32_t cmd_offset, const uint32_t* values, uint32_t position) {
 	const auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
+	// The guest re-emits its full state block per draw. One memcmp for the packet is much
+	// cheaper than dispatching every register when nothing changed.
+	if (cp.ConsumeRegisterPacket(space, cmd_offset, values, num_values)) {
+		return num_values + 1u;
+	}
 	for (uint32_t i = 0; i < num_values; i++) {
 		const auto offset = cmd_offset + i;
 		if (offset >= std::size(table) || table[offset] == nullptr) {

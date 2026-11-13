@@ -47,6 +47,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include <xxhash.h>
+
 namespace Libs::Graphics {
 
 std::pair<int32_t, uint32_t> ResolveDrawOffsets(uint32_t index_offset,
@@ -436,6 +438,7 @@ struct DrawCallInfo {
 	bool     indexed        = true;
 	uint32_t index_count    = 0;
 	uint32_t instance_count = 0;
+	uint64_t index_addr     = 0;
 
 	[[nodiscard]] const char* Name() const { return indexed ? "DrawIndex" : "DrawIndexAuto"; }
 };
@@ -888,14 +891,830 @@ static bool IsDepthOnlyDraw(const CommandBuffer& buffer) {
 	return z.z_write_base_addr != 0 || z.stencil_write_base_addr != 0;
 }
 
-bool RenderExecutor::ShouldSkipDepthOnly(const CommandBuffer& buffer) const {
-	return SkipDepthOnlyEnabled() && IsDepthOnlyDraw(buffer);
+bool RenderExecutor::ShouldSkipDepthOnly(CommandBuffer& buffer) {
+	const int  mode        = DepthCacheMode();
+	const bool static_mode = mode == 3 || mode == 6;
+	const bool skip        = SkipDepthOnlyEnabled() || (static_mode && m_static_skip);
+	if (!skip || !IsDepthOnlyDraw(buffer)) {
+		return false;
+	}
+	const auto& z = buffer.GetRegisters().GetDepthRenderTarget();
+	if (mode == 3 || mode == 6) {
+		if (!m_static_skip) {
+			return false;
+		}
+		if (mode == 6) {
+			// The screen-sized depth prepare pass feeds the colour pass depth test. Replaying it
+			// from an older frame would reject pixels of animated geometry, so it always renders.
+			const uint32_t width  = static_cast<uint32_t>(z.size.x_max) + 1u;
+			const uint32_t height = static_cast<uint32_t>(z.size.y_max) + 1u;
+			if (width == Config::GetScreenWidth() && height == Config::GetScreenHeight() &&
+			    z.depth_view.slice_max == z.depth_view.slice_start) {
+				return false;
+			}
+		}
+		ResolveRenderDepthTarget(buffer, m_targets.depth);
+		const auto target_id = m_targets.depth.image_id;
+		if (!target_id) {
+			return false;
+		}
+		auto& target = m_context.GetTextureCache().GetImage(target_id);
+		if (!target.registered) {
+			return false;
+		}
+		const auto key = StaticSnapshotKey(target.info);
+		const auto snapshot =
+		    std::ranges::find(m_static_snapshots, key, &StaticSnapshot::key);
+		if (snapshot == m_static_snapshots.end() || snapshot->image == nullptr) {
+			return false;
+		}
+		// Restore the exact pixels last written by a full render before the colour pass samples
+		// this target. Re-copy only when the target changed since the previous restore.
+		const auto restored = m_restored_versions.find(target_id.index);
+		if (restored == m_restored_versions.end() || restored->second != target.Version()) {
+			target.CopyImage(*snapshot->image);
+			m_restored_versions[target_id.index] = target.Version();
+		}
+		m_static_frame_skipped = true;
+	}
+	if (mode == 4) {
+		// Mode 4 keeps the screen-sized depth prepare pass; only off-screen/arrayed shadow
+		// cascades are replayed. Skipping the main depth target breaks the colour pass.
+		const uint32_t width  = static_cast<uint32_t>(z.size.x_max) + 1u;
+		const uint32_t height = static_cast<uint32_t>(z.size.y_max) + 1u;
+		if (width == Config::GetScreenWidth() && height == Config::GetScreenHeight() &&
+		    z.depth_view.slice_max == z.depth_view.slice_start) {
+			return false;
+		}
+	}
+	if (mode == 5) {
+		if (m_sampled_ranges_prev.empty()) {
+			return false;
+		}
+		const uint32_t width  = static_cast<uint32_t>(z.size.x_max) + 1u;
+		const uint32_t height = static_cast<uint32_t>(z.size.y_max) + 1u;
+		if (width == Config::GetScreenWidth() && height == Config::GetScreenHeight() &&
+		    z.depth_view.slice_max == z.depth_view.slice_start) {
+			return false;
+		}
+		// Only skip cascades the colour pass did not sample last frame. They cannot affect the
+		// presented image, so this is exact rather than a temporal approximation.
+		for (const auto& [address, size]: m_sampled_ranges_prev) {
+			if (size != 0 && z.z_write_base_addr >= address &&
+			    z.z_write_base_addr - address < size) {
+				return false;
+			}
+		}
+	}
+	if (mode >= 3) {
+		// Only a draw that is actually skipped may consume the guest fast-clear bookkeeping;
+		// consuming it for a rendered shadow pass removes its clear and lights the scene wrong.
+		auto& cache = m_context.GetTextureCache();
+		if (z.htile_data_base_addr != 0 &&
+		    cache.IsMetaCleared(z.htile_data_base_addr, z.depth_view.slice_start)) {
+			(void)cache.TouchMeta(z.htile_data_base_addr, z.depth_view.slice_start, false);
+		}
+	}
+	if (mode == 3 || mode == 6) {
+		// ResolveRenderDepthTarget marked the target as an attachment. The draw is skipped, so
+		// clear that state before the colour pass samples it as a texture.
+		ResetBindings();
+	}
+	return true;
+}
+
+// Opt-in shadow/depth replay cache. Unlike KYTY_SKIP_DEPTH_ONLY it never removes a pass: the
+// first frame renders every depth draw normally, and a later frame reuses that frame's target
+// pixels only while the draw's registers and every guest buffer/texture it reads are unchanged.
+// A changed input falls back to a full render, so the visible scene is identical.
+bool RenderExecutor::DepthCacheEnabled() {
+	return DepthCacheMode() != 0;
+}
+
+int RenderExecutor::DepthCacheMode() {
+	static const int mode = [] {
+		const auto* const value = std::getenv("KYTY_DEPTH_CACHE");
+		return (value != nullptr && *value != '\0') ? static_cast<int>(std::strtol(value, nullptr, 10))
+		                                            : 0;
+	}();
+	return mode;
+}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
+uint64_t RenderExecutor::StaticSnapshotKey(const ImageInfo& info) {
+	uint64_t key = XXH3_64bits(&info.data.address, sizeof(info.data.address));
+	key          = XXH3_64bits_withSeed(&info.data.size, sizeof(info.data.size), key);
+	key          = XXH3_64bits_withSeed(&info.pixel_format, sizeof(info.pixel_format), key);
+	key          = XXH3_64bits_withSeed(&info.extent, sizeof(info.extent), key);
+	key          = XXH3_64bits_withSeed(&info.resources, sizeof(info.resources), key);
+	key          = XXH3_64bits_withSeed(&info.samples, sizeof(info.samples), key);
+	return key;
+}
+
+static bool StaticGameInputDown() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Keys held in another application must not keep the game's replay disabled.
+	const auto foreground = GetForegroundWindow();
+	DWORD      owner      = 0;
+	GetWindowThreadProcessId(foreground, &owner);
+	if (owner != GetCurrentProcessId()) {
+		return false;
+	}
+	// The launcher maps the pad to these keys; any held key means the scene is being driven.
+	static const int keys[] = {
+	    'X', 'L', 'K', 'I', 'Z', 'S', 'Q', 'D', 'T', 'G', 'F', 'H',
+	    VK_RETURN, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_PRIOR, VK_NEXT, VK_HOME, VK_END, VK_SPACE,
+	};
+	for (const int key: keys) {
+		if ((GetAsyncKeyState(key) & 0x8000) != 0) {
+			return true;
+		}
+	}
+#endif
+	return false;
+}
+
+static bool DepthCacheLogEnabled() {
+	static const bool enabled = [] {
+		const auto* const value = std::getenv("KYTY_DEPTH_CACHE_LOG");
+		return value != nullptr && *value != '\0' && std::strtoul(value, nullptr, 10) != 0;
+	}();
+	return enabled;
+}
+
+uint64_t RenderExecutor::DepthStateHash(const CommandBuffer& buffer, const DrawCallInfo& draw,
+                                        DepthCacheDraw* parts) {
+	const auto hash_bytes = [](std::span<const uint8_t> bytes, uint64_t seed) {
+		return XXH3_64bits_withSeed(bytes.data(), bytes.size(), seed);
+	};
+	const auto& regs = buffer.GetRegisters();
+	parts->state_ctx = hash_bytes(regs.DepthStateBytes(), 0x9e3779b97f4a7c15ull);
+	parts->state_cfg = hash_bytes(buffer.GetUserConfig().RawBytes(), 0x517cc1b727220a95ull);
+	// The Shader object also carries compute and pixel stage registers. Compute state changes
+	// between graphics draws and pixel state is stale when the depth draw has no pixel shader;
+	// hashing them would reject every replay. Keep the vertex stage always and the pixel stage
+	// only when it can affect this draw's output.
+	const auto& shaders = buffer.GetShaders();
+	const auto& sh_regs = regs.GetShaderRegisters();
+	const auto& db      = sh_regs.db_shader_control;
+	const bool  ps_active =
+	    shaders.GetPs().ps_regs.data_addr != 0 &&
+	    (RegisterColorOutputMask(regs) != 0 || db.shader_kill_enable ||
+	     db.shader_z_export_enable || db.shader_mask_export_enable ||
+	     db.shader_dual_export_enable || db.shader_execute_on_noop || sh_regs.AlphaToMask());
+	// User SGPR arrays carry per-draw resource-table bases and inline constants. They move
+	// between frames even when the emitted geometry is identical, so the register shape and
+	// shader code identify the stage; the bound buffer contents are compared separately.
+	HW::VertexShaderInfo vs = shaders.GetVs();
+	vs.hs_user_sgpr         = {};
+	vs.gs_user_sgpr         = {};
+	vs.hs_regs.user_data_addr = 0;
+	vs.gs_regs.user_data_addr = 0;
+	parts->state_shader =
+	    XXH3_64bits_withSeed(&vs, sizeof(vs), 0x6eed0e9da4d94a4full);
+	if (ps_active) {
+		HW::PixelShaderInfo ps = shaders.GetPs();
+		ps.ps_user_sgpr        = {};
+		parts->state_shader = XXH3_64bits_withSeed(&ps, sizeof(ps), parts->state_shader);
+	}
+	const uint64_t line[2] = {std::bit_cast<uint32_t>(regs.GetLineWidth()),
+	                          regs.GetPrimitiveResetIndex()};
+	parts->state_line      = XXH3_64bits(line, sizeof(line));
+	const uint64_t args[4] = {draw.indexed ? 1u : 0u, draw.index_count, draw.instance_count,
+	                          draw.index_addr};
+	parts->state_args      = XXH3_64bits(args, sizeof(args));
+	parts->state_hash      = XXH3_64bits_withSeed(&parts->state_ctx, sizeof(uint64_t) * 5,
+	                                              0x27d4eb2f165667c5ull);
+	return parts->state_hash;
+}
+
+uint64_t RenderExecutor::DepthTargetHash(const HW::DepthRenderTarget& target, bool clear) {
+	uint64_t seed = clear ? 0x9e3779b97f4a7c15ull : 0x517cc1b727220a95ull;
+	return XXH3_64bits_withSeed(&target, sizeof(target), seed);
+}
+
+uint64_t RenderExecutor::DepthRangeHash(uint64_t address, uint64_t size,
+                                        const DepthCacheDraw* previous, uint32_t index) {
+	constexpr uint64_t kMaxRange = 64ull * 1024 * 1024;
+	if (address == 0 || size == 0 || size > kMaxRange) {
+		return 0;
+	}
+	auto& buffer_cache = m_context.GetBufferCache();
+	// Reading a range with pending GPU writes would make the tracker download it to the CPU
+	// and stall the frame. Merely being GPU-owned is fine once the bytes are current; such a
+	// draw can still be hashed without a readback.
+	if (buffer_cache.HasGpuDirtyBytes(address, size)) {
+		return 0;
+	}
+	const bool cpu_modified = buffer_cache.IsRegionCpuModified(address, size);
+	// Static ranges repeat across hundreds of draws (shared vertex data); hash them once per
+	// frame instead of once per draw. Dirty ranges are small and always rehashed, so a guest
+	// rewrite is still observed.
+	const uint64_t key = address ^ (size * 0x9e3779b97f4a7c15ull);
+	if (!cpu_modified && !m_depth_range_dirty.contains(key)) {
+		if (previous != nullptr && index < previous->ranges.size()) {
+			const auto& old = previous->ranges[index];
+			if (old.address == address && old.size == size) {
+				return old.hash;
+			}
+		}
+		const auto it = m_depth_range_cache.find(key);
+		if (it != m_depth_range_cache.end() && it->second.address == address &&
+		    it->second.size == size) {
+			return it->second.hash;
+		}
+		const auto hash = XXH3_64bits(reinterpret_cast<const void*>(address), size);
+		if (m_depth_range_cache.size() < 16384) {
+			m_depth_range_cache.emplace(key, DepthCacheRange {address, size, hash});
+		}
+		return hash;
+	}
+	// A range that was dirty once this frame may have been uploaded and the dirty bit cleared;
+	// do not trust an older hash for the rest of the frame.
+	m_depth_range_dirty.insert(key);
+	return XXH3_64bits(reinterpret_cast<const void*>(address), size);
+}
+
+struct DepthTimer {
+	uint64_t& target;
+	uint64_t  start = Common::PerfProbe::Now();
+	explicit DepthTimer(uint64_t& ns): target(ns) {}
+	~DepthTimer() { target += Common::PerfProbe::Now() - start; }
+};
+
+bool RenderExecutor::TryReplayDepthDraw(CommandBuffer& buffer, const DrawCallInfo& draw) {
+	m_depth_record = false;
+	if (!DepthCacheEnabled()) {
+		return false;
+	}
+	if (DepthCacheMode() >= 3) {
+		// Static modes only gate the existing depth-only skip; the decision is made in DrawIndex.
+		return false;
+	}
+	if (DepthCacheMode() >= 2) {
+		// Mode 2 compares the PM4 packets that set up this draw. The hash covers every register
+		// write and every DMA copy since the previous draw, so an identical hash means the
+		// draw is fed by exactly the same command stream. The colour pass itself always runs.
+		if (!IsDepthOnlyDraw(buffer)) {
+			return false;
+		}
+		const auto& hw = buffer.GetRegisters();
+		const auto& rc = hw.GetRenderControl();
+		if (rc.copy_depth_to_color || rc.copy_stencil_to_color) {
+			return false;
+		}
+		const uint64_t hash      = buffer.GetCommandHash();
+		const auto     ordinal   = static_cast<uint32_t>(m_depth_hash_current.size());
+		m_depth_hash_current.push_back(hash);
+		if (!m_depth_hash_skip_disabled && ordinal < m_depth_hash_prev.size() &&
+		    m_depth_hash_prev[ordinal] == hash && hash != 0) {
+			m_depth_hash_skip_count++;
+			return true;
+		}
+		m_depth_hash_render_count++;
+		// A cleared target or a changed stream invalidates every later draw in this frame:
+		// rendering one draw after a clear would otherwise leave the skipped pixels missing.
+		m_depth_hash_skip_disabled = true;
+		return false;
+	}
+	if (!IsDepthOnlyDraw(buffer)) {
+		// The first draw of the next pass closes the cached one. Pinning its target version here
+		// catches a later color pass that writes the same depth image: its pixels are not the
+		// pass output the cache would reuse.
+		if (!m_depth_frame.empty() && m_depth_frame.back().target_version == 0 &&
+		    m_depth_frame.back().target_id) {
+			auto& pass          = m_depth_frame.back();
+			pass.target_version = m_context.GetTextureCache().GetImage(pass.target_id).Version();
+		}
+		return false;
+	}
+	DepthTimer timer(m_depth_try_ns);
+	const auto& hw = buffer.GetRegisters();
+	const auto& rc = hw.GetRenderControl();
+	if (rc.copy_depth_to_color || rc.copy_stencil_to_color) {
+		return false;
+	}
+	if (m_context.GetOcclusionQueries().Open()) {
+		return false;
+	}
+	// Use the raw depth-target registers as the pass key. Resolving the host image here would
+	// bind the target twice per draw and change its layout tracking; the prepared draw records
+	// the host ImageId on the first execution instead.
+	const auto& z = hw.GetDepthRenderTarget();
+	if (z.z_info.format == Prospero::DepthFormat::kInvalid || z.z_write_base_addr == 0 ||
+	    z.z_info.max_mip_level != 0 || z.z_info.partially_resident) {
+		m_depth_uncacheable = true;
+		m_depth_skip_rest   = true;
+		return false;
+	}
+	const bool htile = z.z_info.htile_acceleration || z.htile_data_base_addr != 0;
+	if (z.stencil_info.format != Prospero::StencilFormat::kInvalid) {
+		m_depth_reason_stencil++;
+	}
+	const bool meta_clear =
+	    htile && m_context.GetTextureCache().IsMetaCleared(z.htile_data_base_addr,
+	                                                       z.depth_view.slice_start);
+	const uint64_t target_hash = DepthTargetHash(z, rc.depth_clear_enable);
+	const bool     clear       = rc.depth_clear_enable;
+	bool           new_pass    = m_depth_frame.empty();
+	if (!new_pass) {
+		auto& last = m_depth_frame.back();
+		if (last.target_hash != target_hash) {
+			new_pass = true;
+		} else if (clear && !last.draws.empty()) {
+			// A second explicit clear of the same target starts a second pass.
+			new_pass = true;
+		}
+	}
+	if (new_pass) {
+		if (!m_depth_frame.empty()) {
+			auto& previous = m_depth_frame.back();
+			if (previous.target_id && previous.target_version == 0) {
+				previous.target_version =
+				    m_context.GetTextureCache().GetImage(previous.target_id).Version();
+			}
+		}
+		DepthCachePass pass;
+		pass.target_hash = target_hash;
+		const uint32_t pass_index = static_cast<uint32_t>(m_depth_frame.size());
+		pass.cacheable            = true;
+		if (m_depth_cache_ready) {
+			if (pass_index >= m_depth_cache.size()) {
+				pass.skip_rest = true;
+				m_depth_reason_pass++;
+			} else {
+				const auto& cached = m_depth_cache[pass_index];
+				const auto& image  = m_context.GetTextureCache().GetImage(cached.target_id);
+				if (!cached.cacheable) {
+					// Rebuild a pass that was a placeholder last frame.
+					pass.skip_rest = true;
+					m_depth_reason_cached_invalid++;
+				} else if (!cached.target_id || !image.registered ||
+				           cached.target_hash != target_hash) {
+					pass.skip_rest = true;
+					m_depth_reason_target++;
+				} else {
+					pass.target_id = cached.target_id;
+				}
+			}
+		}
+		m_depth_frame.push_back(std::move(pass));
+	}
+	const uint32_t pass_index = static_cast<uint32_t>(m_depth_frame.size() - 1);
+	auto&          pass       = m_depth_frame[pass_index];
+	const bool     first_draw = pass.draws.empty();
+	DepthCacheDraw state_parts;
+	const uint64_t state_hash = DepthStateHash(buffer, draw, &state_parts);
+	const bool can_compare = m_depth_cache_ready && pass.cacheable && !pass.skip_rest &&
+	                         pass_index < m_depth_cache.size();
+	if (can_compare) {
+		const auto& cached = m_depth_cache[pass_index];
+		const auto  index  = static_cast<uint32_t>(pass.draws.size());
+		m_depth_reason_compared++;
+		if (index < cached.draws.size()) {
+			const auto& old          = cached.draws[index];
+			bool        state_match  = old.cacheable && old.state_hash == state_hash;
+			bool        ranges_match = true;
+			bool        images_match = true;
+			if (old.cacheable && !state_match) {
+				m_depth_reason_state++;
+				if (old.state_ctx != state_parts.state_ctx) m_depth_reason_state_ctx++;
+				if (old.state_cfg != state_parts.state_cfg) m_depth_reason_state_cfg++;
+				if (old.state_shader != state_parts.state_shader) m_depth_reason_state_shader++;
+				if (old.state_args != state_parts.state_args) m_depth_reason_state_args++;
+				if (old.state_line != state_parts.state_line) m_depth_reason_state_line++;
+			}
+			for (uint32_t i = 0; state_match && i < old.range_count; i++) {
+				if (DepthRangeHash(old.ranges[i].address, old.ranges[i].size, &old, i) !=
+				    old.ranges[i].hash) {
+					ranges_match = false;
+					break;
+				}
+			}
+			for (uint32_t i = 0; images_match && i < old.image_count; i++) {
+				const auto& image = m_context.GetTextureCache().GetImage(old.images[i].id);
+				// The version also moves when a sampled image refreshes cache bookkeeping. Only
+				// an actual CPU or GPU content change must stop the replay.
+				images_match = old.images[i].id && image.registered && !image.IsCpuDirty() &&
+				               !image.IsGpuModified();
+			}
+			if (!ranges_match) m_depth_reason_range++;
+			if (!images_match) m_depth_reason_target++;
+			bool match = state_match && ranges_match && images_match;
+			if (match) {
+				if (meta_clear &&
+				    !m_context.GetTextureCache().TouchMeta(z.htile_data_base_addr,
+				                                           z.depth_view.slice_start, false)) {
+					match = false;
+					m_depth_reason_meta++;
+				} else {
+					pass.draws.push_back(old);
+					pass.skipped = true;
+					m_depth_skip_count++;
+					return true;
+				}
+			}
+		} else {
+			m_depth_reason_pass++;
+		}
+	}
+	// If the pass's first draw executes, its clear wipes the pixels the later draws would have
+	// replayed; render the whole pass instead. Skipping the first draw suppresses its clear,
+	// which keeps the cached contents valid.
+	if (first_draw && clear) {
+		pass.skip_rest = true;
+	}
+	// The draw executes. Record its inputs so the next frame can compare them. A pass that is
+	// not promotable still records placeholders, keeping every later draw index aligned.
+	m_depth_pending      = state_parts;
+	m_depth_pending_hash = state_hash;
+	m_depth_pending_pass = pass_index;
+	m_depth_record       = true;
+	return false;
+}
+
+void RenderExecutor::ReplayDepthRecordDraw(const DrawRenderState& state, const DrawEmitInfo& emit,
+                                           const DrawIndexBufferSource& index_source,
+                                           std::span<PreparedBindings* const> stages) {
+	if (!m_depth_record || m_depth_pending_pass >= m_depth_frame.size()) {
+		m_depth_record = false;
+		return;
+	}
+	DepthTimer timer(m_depth_record_ns);
+	m_depth_record = false;
+	auto& pass      = m_depth_frame[m_depth_pending_pass];
+	auto& draw      = m_depth_pending;
+	draw.state_hash = m_depth_pending_hash;
+	bool ok             = true;
+	bool reason_writes  = false;
+	bool reason_range   = false;
+	if (m_targets.depth.image_id) {
+		pass.target_id = m_targets.depth.image_id;
+	} else {
+		ok = false;
+	}
+
+	const DepthCacheDraw* previous = nullptr;
+	if (m_depth_pending_pass < m_depth_cache.size()) {
+		const auto& old_pass = m_depth_cache[m_depth_pending_pass];
+		if (pass.draws.size() < old_pass.draws.size()) {
+			previous = &old_pass.draws[pass.draws.size()];
+		}
+	}
+	auto add_range = [&](uint64_t address, uint64_t size) {
+		if (address == 0 || size == 0) {
+			return;
+		}
+		if (size > 64ull * 1024 * 1024) {
+			ok           = false;
+			reason_range = true;
+			return;
+		}
+		if (draw.range_count >= DepthCacheDraw::MaxRanges) {
+			ok           = false;
+			reason_range = true;
+			return;
+		}
+		const auto index = draw.range_count;
+		auto       hash  = DepthRangeHash(address, size, previous, index);
+		if (hash == 0) {
+			ok           = false;
+			reason_range = true;
+			return;
+		}
+		draw.ranges[draw.range_count++] = {address, size, hash};
+	};
+	const auto& vs = state.vertex_info[0];
+	for (uint32_t i = 0; i < static_cast<uint32_t>(vs.buffers_num); i++) {
+		const auto& b    = vs.buffers[i];
+		const auto  size = static_cast<uint64_t>(b.stride) * b.num_records;
+		add_range(b.addr, size);
+	}
+
+	if (index_source.address != 0 && index_source.size != 0) {
+		add_range(index_source.address, index_source.size);
+	}
+	if (emit.indirect.address != 0 && emit.indirect.count != 0) {
+		add_range(emit.indirect.address,
+		          static_cast<uint64_t>(emit.indirect.count) * emit.indirect.stride);
+	}
+	if (vs.stage.resources != nullptr) {
+		for (const auto& read: vs.stage.resources->specialization_reads) {
+			add_range(read.first, read.second);
+		}
+	}
+	for (auto* stage: stages) {
+		for (const auto& source: stage->buffer_sources) {
+			add_range(source.address, source.size);
+		}
+		if (HasShaderBufferWrites(*stage->runtime)) {
+			ok            = false;
+			reason_writes = true;
+		}
+		for (const auto& binding: stage->images) {
+			if (!binding.image_id) continue;
+			if (binding.image_id == m_targets.depth.image_id) {
+				ok            = false;
+				reason_writes = true;
+				continue;
+			}
+			if (draw.image_count >= DepthCacheDraw::MaxImages) {
+				ok = false;
+				continue;
+			}
+			draw.images[draw.image_count++] = {
+			    binding.image_id, m_context.GetTextureCache().GetImage(binding.image_id).Version()};
+		}
+	}
+	if (!ok) {
+		// This draw's inputs cannot be compared without a readback. Render it and the rest of
+		// its pass, and do not promote that pass; other passes stay untouched.
+		DepthCacheDraw sentinel;
+		sentinel.cacheable = false;
+		pass.draws.push_back(sentinel);
+		m_depth_frame_draws++;
+		// Depth-only writes are independent: keep the pass replayable and let the neighbouring
+		// draws skip. The sentinel itself renders every frame.
+		m_depth_reason_uncacheable++;
+		if (reason_writes) m_depth_reason_writes++;
+		if (reason_range) m_depth_reason_range++;
+		return;
+	}
+	draw.cacheable = true;
+	pass.draws.push_back(std::move(draw));
+	m_depth_frame_draws++;
+}
+
+void RenderExecutor::DepthCacheEndFrame() {
+	if (!DepthCacheEnabled()) {
+		return;
+	}
+	DepthTimer end_timer(m_depth_end_ns);
+	// A frame can flip more than once (layers); only the first boundary after draws counts.
+	if (DepthCacheMode() >= 3) {
+		if (m_static_frame_draws == 0) {
+			return;
+		}
+	} else if (m_depth_frame.empty() && m_depth_frame_draws == 0 &&
+	           m_depth_hash_current.empty()) {
+		return;
+	}
+	if (DepthCacheMode() >= 3) {
+		const auto shaders = Common::DebugCounters::Get(
+		    Common::DebugCounters::Counter::ShadersCompiled);
+		const bool shader_stable = shaders == m_static_last_shaders;
+		m_static_last_shaders     = shaders;
+		m_static_input            = StaticGameInputDown();
+		if (m_static_input) {
+			m_static_skip    = false;
+			m_static_idle    = 0;
+			m_static_refresh = 0;
+		} else if (m_static_frame_draws >= 1000 && shader_stable) {
+			if (m_static_idle < 100000) {
+				m_static_idle++;
+			}
+			if (m_static_idle >= 150) {
+				m_static_skip = true;
+			}
+		} else {
+			m_static_skip    = false;
+			m_static_idle    = 0;
+			m_static_refresh = 0;
+		}
+		// Refresh the cached shadow maps periodically so idle animations do not freeze.
+		if (m_static_skip) {
+			if (++m_static_refresh >= 48) {
+				m_static_skip    = false;
+				m_static_refresh = 0;
+			}
+		}
+		if ((DepthCacheMode() == 3 || DepthCacheMode() == 6) && !m_static_frame_skipped &&
+		    (m_static_idle >= 120 || m_static_skip)) {
+			// New targets (including the second buffer of a shadow-map ping-pong) are captured
+			// during the last idle frames before activation. Nothing is copied while the level
+			// is loading. Existing snapshots refresh only on activation/periodic-refresh frames.
+			const bool refresh_snapshots = m_static_skip;
+			const auto update_snapshot   = [&](ImageId id) {
+				auto& target = m_context.GetTextureCache().GetImage(id);
+				if (!target.registered) {
+					return;
+				}
+				const auto key = StaticSnapshotKey(target.info);
+				auto       snapshot =
+				    std::ranges::find(m_static_snapshots, key, &StaticSnapshot::key);
+				if (snapshot == m_static_snapshots.end()) {
+					ImageInfo info = target.info;
+					info.data      = {};
+					info.stencil   = {};
+					info.metadata  = {};
+					auto image     = std::make_shared<Image>(m_context.GetGraphics(),
+					                                         m_context.GetCommandScheduler(), info);
+					m_static_snapshots.push_back({key, std::move(image)});
+					snapshot = std::prev(m_static_snapshots.end());
+				} else if (!refresh_snapshots) {
+					return;
+				}
+				if (snapshot->image != nullptr) {
+					snapshot->image->CopyImage(target);
+				}
+			};
+			for (const auto id: m_depth_target_ids) {
+				update_snapshot(id);
+			}
+			for (const auto id: m_sampled_ids) {
+				update_snapshot(id);
+			}
+		}
+		if (!m_static_frame_skipped) {
+			m_sampled_ids_prev = m_sampled_ids;
+		}
+		if (DepthCacheMode() == 5) {
+			m_sampled_ranges_prev.clear();
+			for (const auto id: m_sampled_ids) {
+				const auto& image = m_context.GetTextureCache().GetImage(id);
+				if (!image.registered || !image.info.IsDepth() || image.info.data.size == 0) {
+					continue;
+				}
+				const auto address = image.info.data.address;
+				bool       duplicate = false;
+				for (const auto& [old_address, old_size]: m_sampled_ranges_prev) {
+					(void)old_size;
+					if (old_address == address) {
+						duplicate = true;
+						break;
+					}
+				}
+				if (!duplicate) {
+					m_sampled_ranges_prev.emplace_back(address, image.info.data.size);
+				}
+			}
+		}
+		m_sampled_ids.clear();
+		m_sampled_seen.clear();
+		m_depth_target_ids.clear();
+		m_sampled_restored = false;
+		if (!m_static_skip || !m_static_frame_skipped) {
+			m_restored_versions.clear();
+		}
+		m_static_frame_skipped = false;
+		if (DepthCacheLogEnabled()) {
+			static uint32_t log_frame = 0;
+			if ((++log_frame % 60u) == 0) {
+				std::printf("STATIC_CACHE mode=%d idle=%u skip=%d input=%d draws=%llu "
+				            "shaders=%llu sampled=%zu snapshots=%zu\n",
+				            DepthCacheMode(), m_static_idle, m_static_skip ? 1 : 0,
+				            m_static_input ? 1 : 0,
+				            static_cast<unsigned long long>(m_static_frame_draws),
+				            static_cast<unsigned long long>(shaders), m_sampled_ranges_prev.size(),
+				            m_static_snapshots.size());
+				std::fflush(stdout);
+			}
+		}
+		m_static_frame_draws = 0;
+		return;
+	}
+	if (DepthCacheMode() >= 2) {
+		const bool enough = m_depth_hash_current.size() >= 200;
+		if (enough) {
+			m_depth_hash_prev = std::move(m_depth_hash_current);
+		} else {
+			m_depth_hash_prev.clear();
+		}
+		m_depth_hash_current.clear();
+		m_depth_hash_skip_disabled = false;
+		if (DepthCacheLogEnabled()) {
+			static uint32_t log_frame = 0;
+			if ((++log_frame % 60u) == 0) {
+				std::printf("DEPTH_HASH frame=%u prev=%zu skipped=%u rendered=%u\n", log_frame,
+				            m_depth_hash_prev.size(), m_depth_hash_skip_count,
+				            m_depth_hash_render_count);
+				std::fflush(stdout);
+			}
+		}
+		m_depth_hash_skip_count   = 0;
+		m_depth_hash_render_count = 0;
+		return;
+	}
+	if (DepthCacheLogEnabled()) {
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			std::printf("DEPTH_CACHE active\n");
+			std::fflush(stdout);
+		}
+	}
+	const auto shaders = Common::DebugCounters::Get(Common::DebugCounters::Counter::ShadersCompiled);
+	const bool stable  = shaders == m_depth_last_shaders;
+	m_depth_last_shaders = shaders;
+	const bool baseline = stable && !m_depth_uncacheable;
+	bool       promote  = baseline;
+	uint32_t   total    = 0;
+	for (uint32_t i = 0; i < static_cast<uint32_t>(m_depth_frame.size()); i++) {
+		auto& pass = m_depth_frame[i];
+		if (!pass.cacheable) {
+			// A pass with a placeholder is kept as a non-replayable entry; its neighbours can
+			// still be promoted and replayed.
+			m_depth_reason_notcacheable++;
+		} else if (!pass.target_id) {
+			pass.cacheable = false;
+			m_depth_reason_no_target++;
+		} else if (pass.target_version == 0 && !pass.draws.empty()) {
+			pass.target_version = m_context.GetTextureCache().GetImage(pass.target_id).Version();
+		}
+		if (pass.cacheable && pass.target_id && pass.target_version != 0 &&
+		    m_context.GetTextureCache().GetImage(pass.target_id).Version() != pass.target_version) {
+			// Sampling a depth image refreshes cache bookkeeping and bumps its version even
+			// though the pixels did not change. Keep the pass; a real colour-pass write is
+			// caught by the attachment-write path below instead.
+			m_depth_reason_version++;
+		}
+		total += static_cast<uint32_t>(pass.draws.size());
+		if (pass.skipped) {
+			if (i >= m_depth_cache.size() || pass.draws.size() < m_depth_cache[i].draws.size()) {
+				promote = false;
+			}
+		}
+	}
+	if (m_depth_cache_ready && m_depth_frame.size() != m_depth_cache.size()) {
+		promote = false;
+	}
+	const bool last_promote = promote && total >= 200;
+	if (last_promote) {
+		m_depth_cache.swap(m_depth_frame);
+		if (m_depth_warmup < 1000) {
+			m_depth_warmup++;
+		}
+		m_depth_cache_ready = m_depth_warmup >= 30;
+	} else if (baseline && total >= 200) {
+		// Keep the previous baseline instead of promoting a frame with a stale pass. The
+		// per-pass checks reject only the images that changed.
+		if (m_depth_warmup < 1000) {
+			m_depth_warmup++;
+		}
+		m_depth_cache_ready = m_depth_warmup >= 30;
+	} else {
+		m_depth_cache.clear();
+		m_depth_cache_ready = false;
+		m_depth_warmup      = 0;
+	}
+	if (DepthCacheLogEnabled()) {
+		static uint32_t log_frame = 0;
+		if ((++log_frame % 60u) == 0) {
+			std::printf("DEPTH_CACHE frame=%u ready=%d warm=%u stable=%d unc=%d total=%u "
+			            "draws=%u skipped=%u state=%u range=%u target=%u pass=%u meta=%u "
+			            "stencil=%u writes=%u version=%u ncache=%u cachedinv=%u compared=%u "
+			            "stparts=%u/%u/%u/%u/%u "
+			            "passes=%zu cachepasses=%zu promote=%d try=%.2fms rec=%.2fms "
+			            "end=%.2fms\n",
+			            log_frame, m_depth_cache_ready ? 1 : 0, m_depth_warmup,
+			            stable ? 1 : 0, m_depth_uncacheable ? 1 : 0, total,
+			            m_depth_frame_draws, m_depth_skip_count, m_depth_reason_state,
+			            m_depth_reason_range, m_depth_reason_target, m_depth_reason_pass,
+			            m_depth_reason_meta, m_depth_reason_stencil, m_depth_reason_writes,
+			            m_depth_reason_version, m_depth_reason_notcacheable,
+			            m_depth_reason_cached_invalid, m_depth_reason_compared,
+			            m_depth_reason_state_ctx, m_depth_reason_state_cfg,
+			            m_depth_reason_state_shader, m_depth_reason_state_args,
+			            m_depth_reason_state_line, m_depth_frame.size(), m_depth_cache.size(),
+			            last_promote ? 1 : 0,
+			            static_cast<double>(m_depth_try_ns) / 60.0 / 1e6,
+			            static_cast<double>(m_depth_record_ns) / 60.0 / 1e6,
+			            static_cast<double>(m_depth_end_ns) / 60.0 / 1e6);
+			std::fflush(stdout);
+		}
+	}
+	m_depth_frame.clear();
+	m_depth_range_cache.clear();
+	m_depth_range_dirty.clear();
+	m_depth_try_ns    = 0;
+	m_depth_record_ns = 0;
+	m_depth_end_ns    = 0;
+	m_depth_reason_state = m_depth_reason_range = m_depth_reason_target =
+	    m_depth_reason_pass = m_depth_reason_meta = m_depth_reason_stencil =
+	        m_depth_reason_writes = m_depth_reason_version = m_depth_reason_notcacheable =
+	            m_depth_reason_cached_invalid = m_depth_reason_compared =
+	                m_depth_reason_uncacheable = 0;
+	m_depth_reason_state_ctx = m_depth_reason_state_cfg = 0;
+	m_depth_reason_state_shader = m_depth_reason_state_args = m_depth_reason_state_line = 0;
+	m_depth_frame_draws = 0;
+	m_depth_skip_count  = 0;
+	m_depth_miss_count  = 0;
+	m_depth_skip_rest   = false;
+	m_depth_uncacheable = false;
+	m_depth_record      = false;
+	m_depth_pending     = {};
 }
 
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             DrawRenderState& state) {
 	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Programs);
-	if (SkipDepthOnlyEnabled() && IsDepthOnlyDraw(buffer)) {
+	if (ShouldSkipDepthOnly(buffer)) {
 		Common::PerfProbe::Add(Common::PerfProbe::Slot::DepthOnlyDraw, 0);
 		return false;
 	}
@@ -926,6 +1745,13 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		}
 	}
 	ResolveRenderDepthTarget(buffer, targets.depth);
+	if ((DepthCacheMode() == 3 || DepthCacheMode() == 6) && !m_static_skip &&
+	    targets.depth.image_id && IsDepthOnlyDraw(buffer)) {
+		if (std::ranges::find(m_depth_target_ids, targets.depth.image_id) ==
+		    m_depth_target_ids.end()) {
+			m_depth_target_ids.push_back(targets.depth.image_id);
+		}
+	}
 	// TODO(PPSA09243): Vulkan passes take one sample count. Where PS5 attachments mix counts,
 	// keep those matching the raster count instead of resolving multisampled shadows.
 	const auto colors       = std::span {targets.colors, targets.color_count};
@@ -1352,6 +2178,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Flush);
 		m_context.GetCommandScheduler().FlushForOverlap();
 	}
+	ReplayDepthRecordDraw(state, emit, index_source, stages);
 	Common::PerfProbe::Tick();
 }
 
@@ -1391,6 +2218,7 @@ static std::optional<DrawEmitInfo> ResolveDrawEmit(const HW::UserConfig&        
 
 bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	m_static_frame_draws++;
 	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::DrawIndexTotal);
 	Common::PerfProbe::Span  prefix(Common::PerfProbe::Slot::DrawPrefix);
 
@@ -1421,7 +2249,7 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 	}
 
 	// Skip depth-only passes before the per-draw setup, not just before the program work.
-	if (SkipDepthOnlyEnabled() && IsDepthOnlyDraw(buffer)) {
+	if (ShouldSkipDepthOnly(buffer)) {
 		Common::PerfProbe::Add(Common::PerfProbe::Slot::DepthOnlyDraw, 0);
 		return true;
 	}
@@ -1477,9 +2305,15 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 		index_source.size      = expanded_indices.size() * sizeof(uint16_t);
 	}
 
-	const DrawCallInfo draw {true, args.index_count, args.instance_count};
+	const DrawCallInfo draw {true, args.index_count, args.instance_count,
+	                         reinterpret_cast<uint64_t>(args.index_addr)};
 	prefix.Stop();
+	if (TryReplayDepthDraw(buffer, draw)) {
+		ResetBindings();
+		return true;
+	}
 	if (!PrepareDrawRenderState(buffer, draw, state)) {
+		m_depth_record = false;
 		ResetBindings();
 		return true;
 	}
@@ -1489,6 +2323,8 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 	                                  args.base_vertex, args.first_instance, args.indirect);
 	if (emit) {
 		ExecutePreparedDraw(buffer, draw, state, *emit, index_source);
+	} else {
+		m_depth_record = false;
 	}
 	ResetBindings();
 	return emit.has_value();
@@ -1497,6 +2333,7 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	m_static_frame_draws++;
 	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::DrawIndexTotal);
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1525,7 +2362,7 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 	}
 
 	// Skip depth-only passes before the per-draw setup, not just before the program work.
-	if (SkipDepthOnlyEnabled() && IsDepthOnlyDraw(buffer)) {
+	if (ShouldSkipDepthOnly(buffer)) {
 		Common::PerfProbe::Add(Common::PerfProbe::Slot::DepthOnlyDraw, 0);
 		return true;
 	}
@@ -1547,7 +2384,7 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 
 	hw_check(buffer);
 
-	const DrawCallInfo draw {false, args.vertex_count, args.instance_count};
+	const DrawCallInfo draw {false, args.vertex_count, args.instance_count, 0};
 
 	DrawRenderState state {.indirect_offsets = args.indirect.offsets,
 	                       .indirect_draw    = args.indirect.address != 0};
@@ -1555,7 +2392,12 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 		ResetBindings();
 		return true;
 	}
+	if (TryReplayDepthDraw(buffer, draw)) {
+		ResetBindings();
+		return true;
+	}
 	if (!PrepareDrawRenderState(buffer, draw, state)) {
+		m_depth_record = false;
 		ResetBindings();
 		return true;
 	}
@@ -1580,6 +2422,8 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 	                                  args.indirect);
 	if (emit) {
 		ExecutePreparedDraw(buffer, draw, state, *emit, {});
+	} else {
+		m_depth_record = false;
 	}
 	ResetBindings();
 	return emit.has_value();

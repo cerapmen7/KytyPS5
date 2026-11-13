@@ -89,6 +89,10 @@ public:
 	// Returns true when the write repeats the current shadowed value and may be skipped;
 	// otherwise records the value and returns false (the caller applies the handler).
 	bool ConsumeRegisterWrite(RegisterSpace space, uint32_t offset, uint32_t value);
+	// Packet-level form: returns true when every value of a SET_*_REG packet repeats the
+	// current shadow, so none of the per-register handler calls is needed.
+	bool ConsumeRegisterPacket(RegisterSpace space, uint32_t offset, const uint32_t* values,
+	                           uint32_t count);
 	void InvalidateRegisterShadow(RegisterSpace space);
 	void InvalidateAllRegisterShadows();
 
@@ -162,6 +166,8 @@ private:
 	// read only when a later draw inherits it.
 	uint32_t m_num_instances      = 1;
 	uint64_t m_num_instances_addr = 0;
+	// Hash of the PM4 packets since the previous draw; read by the depth replay cache.
+	uint64_t m_command_segment_hash = 0;
 
 	const int      m_interrupt_event_id;
 	const uint32_t m_flush_draws                 = Config::GetFlushDraws();

@@ -69,9 +69,15 @@ public:
 	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
 	void CopyMipRegion(Image& source, uint32_t mip, uint32_t layer, vk::Offset3D source_offset);
 
+	// Monotonic content generation. Every operation that can change the pixels bumps it, so a
+	// replay cache can tell whether an image still holds the result it rendered earlier.
+	[[nodiscard]] uint64_t Version() const noexcept { return m_version; }
+	void                   BumpVersion() noexcept { m_version++; }
+
 	void MarkCpuDirty() {
 		m_cpu_dirty       = true;
 		m_maybe_cpu_dirty = false;
+		m_version++;
 		HeapChanged();
 	}
 
@@ -96,12 +102,16 @@ public:
 	}
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
-	void               MarkGpuModified() noexcept { m_gpu_modified = true; }
-	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
+	void               MarkGpuModified() noexcept {
+		m_gpu_modified = true;
+		m_version++;
+	}
+	void ClearGpuModified() noexcept { m_gpu_modified = false; }
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
 	void               MarkBufferModified() noexcept {
 		m_buffer_modified = true;
+		m_version++;
 		HeapChanged();
 	}
 	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
@@ -170,6 +180,7 @@ private:
 	bool              m_maybe_cpu_dirty = false;
 	bool              m_gpu_modified    = false;
 	bool              m_buffer_modified = false;
+	uint64_t          m_version         = 0;
 };
 
 namespace ImageOps {

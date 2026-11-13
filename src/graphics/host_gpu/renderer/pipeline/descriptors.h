@@ -44,6 +44,8 @@ struct PreparedBindings {
 		BufferSource                          source;
 		vk::DescriptorBufferInfo              info {nullptr, 0, VK_WHOLE_SIZE};
 		uint32_t                              shader_size = 0;
+		uint64_t                              content_hash = 0;
+		bool                                  hash_valid   = false;
 		bool                                  valid       = false;
 	};
 

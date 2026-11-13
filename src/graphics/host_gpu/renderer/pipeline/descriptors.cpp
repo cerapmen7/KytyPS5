@@ -24,6 +24,8 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+
+#include <xxhash.h>
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -864,6 +866,25 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 				prepared.shader_data[layout.MemorySizeDword() + index] = entry.shader_size;
 				continue;
 			}
+			// A CPU write does not always mean new bytes: the scene rewrites the same static
+			// constants every frame. Compare the content before paying for an upload and a
+			// descriptor rewrite. GPU-owned ranges are not read (that would force a download).
+			uint64_t pending_hash  = 0;
+			bool     pending_valid = false;
+			if (entry.valid && entry.source == source && source.address != 0 && source.size != 0 &&
+			    source.size <= 8ull * 1024 * 1024 && !resource.written && !formatted &&
+			    buffer_cache.IsRegionCpuModified(source.address, source.size) &&
+			    !buffer_cache.HasGpuDirtyBytes(source.address, source.size)) {
+				pending_hash = XXH3_64bits(reinterpret_cast<const void*>(source.address), source.size);
+				pending_valid = true;
+				if (entry.hash_valid && entry.content_hash == pending_hash) {
+					prepared.buffers[index] = entry.info;
+					pack_memory_offset(index, entry.shader_size -
+					                              static_cast<uint32_t>(source.size));
+					prepared.shader_data[layout.MemorySizeDword() + index] = entry.shader_size;
+					continue;
+				}
+			}
 			uint32_t buffer_offset = 0;
 			prepared.buffers[index] = NativeStorageBuffer(m_context, source, resource,
 			                                              buffer_offset, m_obtain_cache);
@@ -874,6 +895,8 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			entry = {.source = source,
 			         .info   = prepared.buffers[index],
 			         .shader_size = shader_size,
+			         .content_hash = pending_hash,
+			         .hash_valid   = pending_valid,
 			         .valid       = source.address != 0 && source.size != 0 && !resource.written &&
 			                          !formatted};
 		}
@@ -922,6 +945,50 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		} else {
 			binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
 		}
+		if (DepthCacheMode() >= 3) {
+			NoteSampledImage(binding.image_id);
+			// Mode 6 renders the screen depth target every frame; restoring a sampled image
+			// there would put the stale prepass back into the colour pass.
+			if (m_static_skip && DepthCacheMode() == 3) {
+				RestoreSnapshot(binding.image_id);
+			}
+		}
+	}
+}
+
+void RenderExecutor::RestoreSnapshot(ImageId id) {
+	auto& image = m_context.GetTextureCache().GetImage(id);
+	if (!image.registered) {
+		return;
+	}
+	const auto key = StaticSnapshotKey(image.info);
+	const auto snapshot =
+	    std::ranges::find(m_static_snapshots, key, &StaticSnapshot::key);
+	if (snapshot == m_static_snapshots.end() || snapshot->image == nullptr) {
+		return;
+	}
+	const auto version = m_restored_versions.find(id.index);
+	if (version == m_restored_versions.end() || version->second != image.Version()) {
+		image.CopyImage(*snapshot->image);
+		m_restored_versions[id.index] = image.Version();
+	}
+}
+
+void RenderExecutor::NoteSampledImage(ImageId id) {
+	if (!id) {
+		return;
+	}
+	if (m_sampled_ids.size() >= 32) {
+		return;
+	}
+	const auto& image = m_context.GetTextureCache().GetImage(id);
+	// Keep the exact image the shader binds, not only its depth owner: aliased colour views
+	// are separate Vulkan images and must be restored too.
+	if (!image.registered || (!image.info.IsDepth() && !image.depth_id)) {
+		return;
+	}
+	if (m_sampled_seen.insert(id.index).second) {
+		m_sampled_ids.push_back(id);
 	}
 }
 

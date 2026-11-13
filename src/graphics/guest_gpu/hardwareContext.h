@@ -6,6 +6,8 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 
 #include <array>
+#include <span>
+#include <type_traits>
 
 namespace Libs::Graphics::HW {
 
@@ -831,6 +833,20 @@ public:
 	}
 	void SetAlphaToMaskEnable(bool value) { m_sh_regs.alpha_to_mask_enable = value; }
 
+	// Byte view of the decoded state for the depth-pass replay cache. The cache only needs
+	// equality of the register values; padding is harmless because the object is reused.
+	[[nodiscard]] std::span<const uint8_t> RawBytes() const noexcept {
+		static_assert(std::is_trivially_copyable_v<Context>);
+		return {reinterpret_cast<const uint8_t*>(this), sizeof(*this)};
+	}
+	// The subset that can affect a depth-only draw. Color targets and blend state rotate between
+	// swapchain buffers and must not invalidate an otherwise identical shadow pass.
+	[[nodiscard]] std::span<const uint8_t> DepthStateBytes() const noexcept {
+		const auto* begin = reinterpret_cast<const uint8_t*>(&m_screen_viewport);
+		const auto* end   = reinterpret_cast<const uint8_t*>(&m_sh_regs) + sizeof(m_sh_regs);
+		return {begin, static_cast<size_t>(end - begin)};
+	}
+
 private:
 	float    m_line_width            = 1.0f;
 	uint32_t m_primitive_reset_index = 0xffffffffu;
@@ -892,6 +908,11 @@ public:
 	[[nodiscard]] const GeUserVgprEn& GetGeUserVgprEn() const { return m_ge_user_vgpr_en; }
 	void SetGeUserVgprEn(const GeUserVgprEn& en) { m_ge_user_vgpr_en = en; }
 
+	[[nodiscard]] std::span<const uint8_t> RawBytes() const noexcept {
+		static_assert(std::is_trivially_copyable_v<UserConfig>);
+		return {reinterpret_cast<const uint8_t*>(this), sizeof(*this)};
+	}
+
 private:
 	Prospero::PrimitiveType m_prim_type               = Prospero::PrimitiveType::kNone;
 	uint32_t                m_index_offset            = 0;
@@ -941,6 +962,11 @@ public:
 	[[nodiscard]] const PixelShaderInfo&   GetPs() const { return m_ps; }
 	[[nodiscard]] const VertexShaderInfo&  GetVs() const { return m_vs; }
 	[[nodiscard]] const ComputeShaderInfo& GetCs() const { return m_cs; }
+
+	[[nodiscard]] std::span<const uint8_t> RawBytes() const noexcept {
+		static_assert(std::is_trivially_copyable_v<Shader>);
+		return {reinterpret_cast<const uint8_t*>(this), sizeof(*this)};
+	}
 
 private:
 	static void SetUserDataAddressWord(uint64_t& address, uint32_t word, uint32_t value) {

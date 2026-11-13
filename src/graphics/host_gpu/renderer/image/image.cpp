@@ -250,6 +250,7 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
                    uint64_t size) {
 	EXIT_IF(copies.empty() || buffer == nullptr || size == 0);
+	BumpVersion();
 	m_scheduler.EndRendering();
 	vk::BufferMemoryBarrier2 buffer_barrier {};
 	buffer_barrier.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
@@ -348,6 +349,7 @@ std::pair<uint32_t, uint32_t> Image::SanitizeCopyLayers(const Image& source,
 
 void Image::CopyImage(Image& source) {
 	EXIT_IF(source.backing.samples != backing.samples);
+	BumpVersion();
 	m_scheduler.EndRendering();
 	const uint32_t levels     = std::min(source.backing.mip_levels, backing.mip_levels);
 	uint32_t       base_depth = source.backing.extent.depth;
@@ -402,6 +404,7 @@ void Image::CopyImage(Image& source) {
 
 void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
                     const ImageSubresourceRange& destination_range) {
+	BumpVersion();
 	EXIT_IF(backing.samples != 1 || source.backing.image_type != vk::ImageType::e2D ||
 	        backing.image_type != vk::ImageType::e2D || source_range.level_count != 1 ||
 	        destination_range.level_count != 1 ||
@@ -467,6 +470,7 @@ uint32_t Image::CopyRows(uint64_t row_size, uint32_t rows, uint64_t capacity) no
 }
 
 void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler) {
+	BumpVersion();
 	EXIT_IF(buffer.Handle() == nullptr || source.backing.samples != 1 || backing.samples != 1);
 	m_scheduler.EndRendering();
 	const uint32_t levels = std::min(source.backing.mip_levels, backing.mip_levels);
@@ -568,6 +572,7 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 }
 
 void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
+	BumpVersion();
 	EXIT_IF(source.backing.samples != backing.samples || mip >= backing.mip_levels ||
 	        layer >= backing.layers);
 	m_scheduler.EndRendering();
@@ -602,6 +607,7 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 
 void Image::CopyMipRegion(Image& source, uint32_t mip, uint32_t layer,
                           vk::Offset3D source_offset) {
+	BumpVersion();
 	EXIT_IF(source.backing.samples != backing.samples || mip >= backing.mip_levels ||
 	        layer >= backing.layers);
 	m_scheduler.EndRendering();

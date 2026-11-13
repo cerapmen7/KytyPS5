@@ -26,12 +26,15 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <semaphore>
 #include <thread>
 #include <vector>
+
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -192,6 +195,7 @@ void CommandProcessor::Reset() {
 	m_predicate_skip                   = false;
 	m_draw_indirect_args_base_addr     = 0;
 	m_dispatch_indirect_args_base_addr = 0;
+	m_command_segment_hash             = 0;
 }
 
 void CommandProcessor::ApplyContextStateOperation(ContextStateOperation operation) {
@@ -543,6 +547,7 @@ bool GuestGpu::Process(Submission& submission) {
 			break;
 		case SubmissionType::FlipPreparation:
 			cp.PrepareCpuFlip(submission.flip_request_id);
+			m_renderer.GetRenderExecutor().DepthCacheEndFrame();
 			break;
 		case SubmissionType::SuspendPoint:
 			// Age caches at the frame boundary, not once per command list.
@@ -620,6 +625,18 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		const auto        packet_header = packet[0];
 		const auto        opcode        = (packet_header >> 8u) & 0xffu;
 		const auto        header_len_dw = KYTY_PM4_LEN(packet_header);
+
+		// Signature of the packets that set up the next draw. Only mode 2 consumes it; hashing
+		// every packet in the normal full-render path would cost more than it saves.
+		static const bool command_hash_enabled = [] {
+			const auto* const value = std::getenv("KYTY_DEPTH_CACHE");
+			return value != nullptr && std::strtol(value, nullptr, 10) == 2;
+		}();
+		if (command_hash_enabled && header_len_dw != 0 && header_len_dw <= remaining_dw) {
+			m_command_segment_hash = XXH3_64bits_withSeed(
+			    packet, static_cast<size_t>(header_len_dw) * sizeof(uint32_t),
+			    m_command_segment_hash);
+		}
 
 		// Zero-code NOP fillers carry no state; skip them without a handler call.
 		if (opcode == Pm4::IT_NOP && KYTY_PM4_R(packet_header) == Pm4::R_ZERO) {
@@ -744,6 +761,60 @@ bool CommandProcessor::ConsumeRegisterWrite(RegisterSpace space, uint32_t offset
 	}
 	values[offset] = value;
 	return false;
+}
+
+bool CommandProcessor::ConsumeRegisterPacket(RegisterSpace space, uint32_t offset,
+                                             const uint32_t* values, uint32_t count) {
+	if (count == 0) {
+		return false;
+	}
+	const uint32_t* shadow;
+	const uint32_t* epochs;
+	uint32_t        gen;
+	switch (space) {
+		case RegisterSpace::Cx:
+			if (offset + count > Pm4::CX_NUM) {
+				return false;
+			}
+			shadow = m_shadow_cx_value.data();
+			epochs = m_shadow_cx_epoch.data();
+			gen    = m_shadow_cx_gen;
+			break;
+		case RegisterSpace::Sh:
+			if (offset + count > Pm4::SH_NUM) {
+				return false;
+			}
+			for (uint32_t i = 0; i < count; i++) {
+				if (g_hw_sh_func[offset + i] != nullptr) {
+					return false;
+				}
+			}
+			shadow = m_shadow_sh_value.data();
+			epochs = m_shadow_sh_epoch.data();
+			gen    = m_shadow_sh_gen;
+			break;
+		case RegisterSpace::Uc:
+			if (offset + count > Pm4::UC_NUM) {
+				return false;
+			}
+			for (uint32_t i = 0; i < count; i++) {
+				if (offset + i == Pm4::VGT_INDEX_TYPE) {
+					return false;
+				}
+			}
+			shadow = m_shadow_uc_value.data();
+			epochs = m_shadow_uc_epoch.data();
+			gen    = m_shadow_uc_gen;
+			break;
+		default:
+			return false;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		if (epochs[offset + i] != gen) {
+			return false;
+		}
+	}
+	return std::memcmp(shadow + offset, values, count * sizeof(uint32_t)) == 0;
 }
 
 void CommandProcessor::InvalidateRegisterShadow(RegisterSpace space) {
@@ -880,7 +951,11 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	if (args.instance_count == 0) {
 		args.instance_count = NumInstances();
 	}
-	m_renderer.GetRenderExecutor().DrawIndex(CurrentBuffer(), args);
+	auto& buffer = CurrentBuffer();
+	// Indirect records live in a buffer the hash does not cover; do not replay those draws.
+	buffer.SetCommandHash(args.indirect.address != 0 ? 0 : m_command_segment_hash);
+	m_renderer.GetRenderExecutor().DrawIndex(buffer, args);
+	m_command_segment_hash = 0;
 }
 
 const void* CommandProcessor::IndexAddress(uint32_t first_index) const {
@@ -964,6 +1039,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	// The GPU reads the records if the shaders allow; the VS prolog removes Vulkan's bases
 	// from the index VGPRs and copies them only to the user SGPRs the packet patches.
 	DrawIndirectArgs records {args_addr, draw_count, stride_in_bytes};
+	CurrentBuffer().SetCommandHash(0);
 	if (IndirectDrawOffsets(registers, records.offsets)) {
 		if (!indexed && executor.DrawAuto(CurrentBuffer(), {.indirect = records})) {
 			return;
@@ -1002,6 +1078,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		                                     .first_instance      = args.firstInstance,
 		                                     .offset_source = DrawOffsetSource::IndirectArgs});
 	}
+	m_command_segment_hash = 0;
 }
 
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
@@ -1033,7 +1110,10 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	if (args.instance_count == 0) {
 		args.instance_count = NumInstances();
 	}
-	m_renderer.GetRenderExecutor().DrawAuto(CurrentBuffer(), args);
+	auto& buffer = CurrentBuffer();
+	buffer.SetCommandHash(args.indirect.address != 0 ? 0 : m_command_segment_hash);
+	m_renderer.GetRenderExecutor().DrawAuto(buffer, args);
+	m_command_segment_hash = 0;
 }
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
@@ -1216,18 +1296,22 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 	m_renderer.GetBufferCache().DecayReadHot();
 	m_renderer.GetBufferCache().PublishReadHot();
 
+	m_renderer.GetRenderExecutor().DepthCacheEndFrame();
 	auto& command = CurrentBuffer();
 	auto  request = Sync::PrepareVideoOutFlip(command, handle, index, flip_mode, flip_arg);
+	m_command_segment_hash = 0;
 	GetScheduler().DeferPriorityOperation(
 	    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
 	GetScheduler().Flush();
 }
 
 void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
+	m_renderer.GetRenderExecutor().DepthCacheEndFrame();
 	auto& command = CurrentBuffer();
 	m_renderer.GetBufferCache().DecayReadHot();
 	m_renderer.GetBufferCache().PublishReadHot();
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
+	m_command_segment_hash = 0;
 	GetScheduler().DeferPriorityOperation(
 	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
 	GetScheduler().Flush();
