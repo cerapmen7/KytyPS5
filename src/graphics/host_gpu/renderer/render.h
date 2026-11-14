@@ -198,6 +198,10 @@ struct BufferObtainCache {
 
 class DrawPrepQueue;
 
+// Diagnostic: number of draws recorded by ExecutePreparedDraw. Used to measure how many
+// draws a single guest command submission contains.
+[[nodiscard]] uint64_t GraphicsDrawCount();
+
 class RenderExecutor {
 public:
 	explicit RenderExecutor(RenderContext& context): m_context(context) {}

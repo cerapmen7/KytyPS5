@@ -51,6 +51,14 @@
 
 namespace Libs::Graphics {
 
+namespace {
+std::atomic<uint64_t> g_graphics_draw_count {0};
+} // namespace
+
+uint64_t GraphicsDrawCount() {
+	return g_graphics_draw_count.load(std::memory_order_relaxed);
+}
+
 std::pair<int32_t, uint32_t> ResolveDrawOffsets(uint32_t index_offset,
 	                                           const ShaderVertexInputInfo& vs_input_info) {
 	auto     vertex_offset   = static_cast<int32_t>(index_offset);
@@ -1596,6 +1604,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
+	g_graphics_draw_count.fetch_add(1, std::memory_order_relaxed);
 	m_context.GetCommandScheduler().NoteRecordedWork();
 
 	if (shader_write_stages) {

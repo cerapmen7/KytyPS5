@@ -26,6 +26,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -532,6 +533,12 @@ bool GuestGpu::Process(Submission& submission) {
 	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Process);
 	auto& cp = GetProcessor(submission.queue_id);
 
+	static const bool batch_log = [] {
+		const auto* value = std::getenv("KYTY_DRAW_BATCH_LOG");
+		return value != nullptr && *value != '\0' && std::strtoul(value, nullptr, 10) != 0;
+	}();
+	const auto before_draws = batch_log ? GraphicsDrawCount() : 0;
+
 	cp.BufferInit();
 	bool complete = true;
 
@@ -554,6 +561,25 @@ bool GuestGpu::Process(Submission& submission) {
 			cp.BufferFlush();
 			cp.Reset();
 			break;
+	}
+
+	if (batch_log && submission.type == SubmissionType::Commands && submission.queue_id == 0) {
+		static uint64_t histogram[33] {};
+		static uint32_t submissions = 0;
+		const auto      delta = GraphicsDrawCount() - before_draws;
+		histogram[std::min<uint64_t>(delta, 32)]++;
+		if (++submissions % 256 == 0) {
+			std::fprintf(stderr, "SUBBATCH n=%u", submissions);
+			for (uint32_t draws = 0; draws < 33; draws++) {
+				if (histogram[draws] != 0) {
+					std::fprintf(stderr, " %u:%llu", draws,
+					             static_cast<unsigned long long>(histogram[draws]));
+				}
+			}
+			std::fprintf(stderr, "\n");
+			std::fflush(stderr);
+			std::fill(std::begin(histogram), std::end(histogram), 0);
+		}
 	}
 
 	return complete;

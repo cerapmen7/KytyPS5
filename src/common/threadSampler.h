@@ -24,9 +24,12 @@
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <tlhelp32.h>
 
 #pragma comment(lib, "dbghelp.lib")
 #pragma comment(lib, "psapi.lib")
@@ -43,6 +46,7 @@ struct ThreadEntry {
 struct State {
 	std::mutex                mutex;
 	std::vector<ThreadEntry>  threads;
+	std::set<DWORD>           known_tids;
 	std::mutex                counts_mutex;
 	std::map<std::pair<DWORD, uint64_t>, uint64_t> counts;
 	std::atomic<bool>         running {false};
@@ -85,8 +89,59 @@ inline void RegisterThread(const char* name) noexcept {
 	{
 		std::lock_guard lock(state.mutex);
 		state.threads.push_back({name, GetCurrentThreadId(), dup});
+		state.known_tids.insert(GetCurrentThreadId());
 	}
 	Start();
+}
+
+// Diagnostic mode: sample every native thread of the process, including the guest CPU
+// threads that never call RegisterThread. Names are the thread ids.
+inline void RegisterProcessThreads() noexcept {
+	if (!Enabled()) {
+		return;
+	}
+	const auto* value = std::getenv("KYTY_SAMPLE_ALL");
+	if (value == nullptr || *value == '\0' || std::strtoul(value, nullptr, 10) == 0) {
+		return;
+	}
+	auto&  state = Get();
+	const  DWORD self = GetCurrentThreadId();
+	HANDLE snapshot  = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+	if (snapshot == INVALID_HANDLE_VALUE) {
+		return;
+	}
+	THREADENTRY32 entry {};
+	entry.dwSize = sizeof(entry);
+	std::vector<ThreadEntry> added;
+	if (Thread32First(snapshot, &entry) != 0) {
+		do {
+			if (entry.th32OwnerProcessID != GetCurrentProcessId() ||
+			    entry.th32ThreadID == self) {
+				continue;
+			}
+			{
+				std::lock_guard lock(state.mutex);
+				if (state.known_tids.count(entry.th32ThreadID) != 0) {
+					continue;
+				}
+			}
+			HANDLE handle = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+			                           FALSE, entry.th32ThreadID);
+			if (handle == nullptr) {
+				continue;
+			}
+			added.push_back({"all:" + std::to_string(entry.th32ThreadID), entry.th32ThreadID, handle});
+		} while (Thread32Next(snapshot, &entry) != 0);
+	}
+	CloseHandle(snapshot);
+	if (added.empty()) {
+		return;
+	}
+	std::lock_guard lock(state.mutex);
+	for (auto& thread: added) {
+		state.threads.push_back(std::move(thread));
+		state.known_tids.insert(state.threads.back().tid);
+	}
 }
 
 inline void Dump() noexcept {
@@ -209,6 +264,7 @@ inline void Start() noexcept {
 			timeEndPeriod(1);
 			return;
 		}
+		RegisterProcessThreads();
 		const auto interval_ms = [] {
 			const char* value = std::getenv("KYTY_SAMPLE_MS");
 			return (value != nullptr && *value != '\0')
@@ -220,8 +276,8 @@ inline void Start() noexcept {
 			// Collect the instruction pointers first and only touch the heap after every
 			// sampled thread has been resumed: a suspended thread may hold the process heap
 			// lock, and allocating under SuspendThread would deadlock the process.
-			uint64_t keys[16] {};
-			DWORD    tids[16] {};
+			uint64_t keys[128] {};
+			DWORD    tids[128] {};
 			uint32_t count = 0;
 			{
 				std::lock_guard lock(s.mutex);
