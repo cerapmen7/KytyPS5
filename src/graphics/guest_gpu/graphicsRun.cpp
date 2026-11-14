@@ -506,7 +506,49 @@ void GuestGpu::ThreadRun(void* data) {
 		const bool complete = [&] {
 			Common::DebugCounters::ScopedTimer busy(
 			    Common::DebugCounters::Counter::GpuThreadBusyNs);
-			return gpu->Process(submission);
+			if (submission.type != SubmissionType::Commands || submission.queue_id != 0) {
+				return gpu->Process(submission);
+			}
+			// The guest submits one draw per command buffer. Process a bounded run of
+			// graphics submissions before flushing so the draw-preparation workers get a
+			// batch; labels, pending commands and fences still force the flush below.
+			static const uint32_t max_batch = [] {
+				const auto* const value = std::getenv("KYTY_SUBMIT_BATCH");
+				if (value == nullptr || *value == '\0') {
+					return 16u;
+				}
+				return static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+			}();
+			bool ok = gpu->Process(submission, false);
+			if (ok) {
+				for (uint32_t batch = 1; batch < max_batch && !gpu->HasPendingCommands(); batch++) {
+					Submission next;
+					{
+						Common::LockGuard queue_lock(gpu->m_queue_mutex);
+						auto&             queue = gpu->m_queues[0];
+						if (queue.empty() || queue.front().type != SubmissionType::Commands ||
+						    queue.front().blocked) {
+							break;
+						}
+						next = std::move(queue.front());
+						queue.pop_front();
+						gpu->m_submission_count--;
+					}
+					if (!gpu->Process(next, false)) {
+						Common::LockGuard queue_lock(gpu->m_queue_mutex);
+						next.blocked = true;
+						gpu->m_queues[0].push_front(std::move(next));
+						gpu->m_submission_count++;
+						break;
+					}
+					if (gpu->m_renderer.GetCommandScheduler().HasGuestVisibleWork() ||
+					    gpu->HasPendingCommands()) {
+						break;
+					}
+				}
+			}
+			gpu->GetProcessor(0).BufferFlush();
+			return ok;
 		}();
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
@@ -528,7 +570,7 @@ void GuestGpu::ThreadRun(void* data) {
 	}
 }
 
-bool GuestGpu::Process(Submission& submission) {
+bool GuestGpu::Process(Submission& submission, bool flush) {
 	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Process);
 	auto& cp = GetProcessor(submission.queue_id);
 
@@ -540,7 +582,9 @@ bool GuestGpu::Process(Submission& submission) {
 			complete =
 			    cp.Process(submission.execution, submission.commands) == Pm4ProcessResult::Complete;
 			if (submission.execution.MadeProgress()) {
-				cp.BufferFlush();
+				if (flush) {
+					cp.BufferFlush();
+				}
 			}
 			break;
 		case SubmissionType::FlipPreparation:
@@ -660,6 +704,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			packets_until_pending_check = kPendingCheckMask;
 			if (g_gpu_state != nullptr && g_gpu_state->HasPendingCommands()) {
 				Common::PerfProbe::Scope pending(Common::PerfProbe::Slot::PendingOps);
+				// A posted readback can wait for the GPU; record the draws it may depend on
+				// before running it.
+				m_renderer.GetRenderExecutor().FlushPendingDraw();
 				g_gpu_state->ProcessCommands();
 			}
 		}

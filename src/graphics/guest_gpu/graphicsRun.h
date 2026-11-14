@@ -67,7 +67,7 @@ private:
 	[[nodiscard]] bool HasPendingCommands() const noexcept {
 		return m_pending_commands.load(std::memory_order_acquire) != 0;
 	}
-	bool              Process(Submission& submission);
+	bool              Process(Submission& submission, bool flush = true);
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);
 

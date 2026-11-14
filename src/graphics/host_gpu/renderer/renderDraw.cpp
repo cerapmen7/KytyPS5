@@ -671,14 +671,10 @@ public:
 		if (m_jobs.empty()) {
 			return;
 		}
-		std::fprintf(stderr, "FLUSH start jobs=%zu done=%zu\n", m_jobs.size(), m_done);
-		std::fflush(stderr);
 		{
 			std::unique_lock lock(m_mutex);
 			m_cv.wait(lock, [this] { return m_done == m_jobs.size() || m_stop; });
 		}
-		std::fprintf(stderr, "FLUSH done jobs=%zu done=%zu\n", m_jobs.size(), m_done);
-		std::fflush(stderr);
 		for (auto& job: m_jobs) {
 			Record(buffer, *job);
 		}
@@ -770,9 +766,6 @@ private:
 				}
 				job = m_jobs[m_next++].get();
 			}
-			std::fprintf(stderr, "WORK start hash=%llx\n",
-			             static_cast<unsigned long long>(job->registers.GetShaderRegisters().m_cbShaderMask));
-			std::fflush(stderr);
 			bool ok = false;
 			if (AsyncDrawPrepRequested()) {
 				ok = m_executor.m_context.GetPipelineCache().GetGraphicsPrograms(
@@ -780,8 +773,6 @@ private:
 				    &job->prepared_resources);
 			}
 			job->prepared = ok;
-			std::fprintf(stderr, "WORK done ok=%d\n", ok ? 1 : 0);
-			std::fflush(stderr);
 			{
 				std::lock_guard lock(m_mutex);
 				m_done++;

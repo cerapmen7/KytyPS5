@@ -39,6 +39,7 @@ public:
 	void           FlushCoalesced();
 	// Marks work the guest can poll (labels, interrupt events). A deferred submit may not hold it.
 	void           NoteGuestVisibleWork() noexcept { m_guest_visible_work = true; }
+	[[nodiscard]] bool HasGuestVisibleWork() const noexcept { return m_guest_visible_work; }
 	void           Finish();
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
