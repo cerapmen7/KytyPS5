@@ -9,10 +9,15 @@
 #include <algorithm>
 #include <charconv>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <string_view>
 #include <vector>
 #include <magic_enum.hpp>
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#include <windows.h>
+#endif
 
 using namespace Common;
 using namespace Emulator;
@@ -448,6 +453,20 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 }
 
 static int Main(int argc, char* argv[]) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// The launcher pins the whole process away from the core the GPU thread uses. This was
+	// only applied by the lab harness, so the shipped launcher ran with every guest thread
+	// free to preempt the GPU thread.
+	if (const auto* value = std::getenv("KYTY_PROCESS_AFFINITY");
+	    value != nullptr && *value != '\0') {
+		char*      end  = nullptr;
+		const auto mask = std::strtoull(value, &end, 0);
+		if (end == value || *end != '\0' ||
+		    !SetProcessAffinityMask(GetCurrentProcess(), static_cast<DWORD_PTR>(mask))) {
+			::printf("process affinity: invalid or unsupported mask %s\n", value);
+		}
+	}
+#endif
 	InitializeThreads();
 
 	RunOptions options;
