@@ -44,7 +44,7 @@ struct State {
 	std::mutex                mutex;
 	std::vector<ThreadEntry>  threads;
 	std::mutex                counts_mutex;
-	std::map<uint64_t, uint64_t> counts;
+	std::map<std::pair<DWORD, uint64_t>, uint64_t> counts;
 	std::atomic<bool>         running {false};
 	std::thread               worker;
 	uint64_t                  base   = 0;
@@ -91,7 +91,7 @@ inline void RegisterThread(const char* name) noexcept {
 
 inline void Dump() noexcept {
 	auto& state = Get();
-	std::map<uint64_t, uint64_t> counts;
+	std::map<std::pair<DWORD, uint64_t>, uint64_t> counts;
 	{
 		std::lock_guard lock(state.counts_mutex);
 		counts = state.counts;
@@ -119,8 +119,8 @@ inline void Dump() noexcept {
 	rows.reserve(counts.size());
 	for (const auto& [key, count]: counts) {
 		Row row;
-		row.thread  = names[static_cast<DWORD>(key >> 32)];
-		row.address = key & 0xffffffffu;
+		row.thread  = names[key.first];
+		row.address = key.second;
 		row.count   = count;
 		rows.push_back(std::move(row));
 	}
@@ -139,7 +139,7 @@ inline void Dump() noexcept {
 		info->SizeOfStruct                   = sizeof(SYMBOL_INFO);
 		info->MaxNameLen                     = 511;
 		DWORD64 displacement                 = 0;
-		const DWORD64 address = state.base + row.address;
+		const DWORD64 address = row.address;
 		if (SymFromAddr(process, address, &displacement, info) != 0) {
 			row.symbol = std::string(info->Name) + "+0x" +
 			             [&] {
@@ -193,12 +193,35 @@ inline void Start() noexcept {
 	state.worker = std::thread([] {
 		timeBeginPeriod(1);
 		auto& s = Get();
+		// Sampling suspends threads, so doing it during boot turns lock convoys into a crawl.
+		// A delay lets a diagnostic session start in gameplay instead.
+		const auto delay_sec = [] {
+			const char* value = std::getenv("KYTY_SAMPLE_DELAY_SEC");
+			return (value != nullptr && *value != '\0')
+			           ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10))
+			           : 0u;
+		}();
+		for (uint32_t waited = 0; waited < delay_sec && s.running.load(std::memory_order_relaxed);
+		     waited++) {
+			Sleep(1000);
+		}
+		if (!s.running.load(std::memory_order_relaxed)) {
+			timeEndPeriod(1);
+			return;
+		}
+		const auto interval_ms = [] {
+			const char* value = std::getenv("KYTY_SAMPLE_MS");
+			return (value != nullptr && *value != '\0')
+			           ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10))
+			           : 1u;
+		}();
 		uint32_t iterations = 0;
 		while (s.running.load(std::memory_order_relaxed)) {
 			// Collect the instruction pointers first and only touch the heap after every
 			// sampled thread has been resumed: a suspended thread may hold the process heap
 			// lock, and allocating under SuspendThread would deadlock the process.
 			uint64_t keys[16] {};
+			DWORD    tids[16] {};
 			uint32_t count = 0;
 			{
 				std::lock_guard lock(s.mutex);
@@ -212,9 +235,9 @@ inline void Start() noexcept {
 					CONTEXT context {};
 					context.ContextFlags = CONTEXT_CONTROL;
 					if (GetThreadContext(entry.handle, &context) != 0) {
-						const auto rip = static_cast<uint64_t>(context.Rip);
-						keys[count++]   = (static_cast<uint64_t>(entry.tid) << 32u) |
-						                ((rip - s.base) & 0xffffffffu);
+						keys[count] = static_cast<uint64_t>(context.Rip);
+						tids[count] = entry.tid;
+						count++;
 					}
 					ResumeThread(entry.handle);
 				}
@@ -222,13 +245,13 @@ inline void Start() noexcept {
 			if (count != 0) {
 				std::lock_guard counts_lock(s.counts_mutex);
 				for (uint32_t i = 0; i < count; i++) {
-					s.counts[keys[i]]++;
+					s.counts[{tids[i], keys[i]}]++;
 				}
 			}
 			if (++iterations % 5000 == 0) {
 				Dump();
 			}
-			Sleep(1);
+			Sleep(interval_ms);
 		}
 		timeEndPeriod(1);
 	});
