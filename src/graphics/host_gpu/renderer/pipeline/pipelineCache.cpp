@@ -747,7 +747,8 @@ bool PipelineCache::UsesImageHeap(ShaderType stage, uint64_t hash) const {
 bool PipelineCache::GetGraphicsPrograms(const HW::Context& context,
                                         const HW::UserConfig& user_config,
                                         const HW::Shader& shaders, DrawRenderState& state,
-                                        bool allow_async, GraphicsPreparedResources* prepared) {
+                                        bool allow_async, GraphicsPreparedResources* prepared,
+                                        const ShaderVertexTables* tables) {
 	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::GraphicsPrograms);
 	if (allow_async && prepared == nullptr) {
 		return false;
@@ -796,7 +797,10 @@ bool PipelineCache::GetGraphicsPrograms(const HW::Context& context,
 			stage.tess = layout->second;
 		}
 	} else {
-		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
+		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0], tables);
+		if (allow_async && vertex_params[0].code.empty()) {
+			return false;
+		}
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (!tess_active && !mesh_active) {

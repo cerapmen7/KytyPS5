@@ -779,6 +779,7 @@ private:
 		DrawIndexBufferSource           index_source;
 		std::vector<uint16_t>           expanded;
 		GraphicsPreparedResources       prepared_resources;
+		ShaderVertexTables              vertex_tables;
 		std::atomic<int>                stage {0};
 		bool                            prepared = false;
 		bool                            indexed  = true;
@@ -806,6 +807,8 @@ private:
 		if (!job->expanded.empty()) {
 			job->index_source.host_data = job->expanded.data();
 		}
+		job->vertex_tables = {};
+		ShaderCaptureVertexTables(job->shaders.GetVs(), job->vertex_tables);
 		return job;
 	}
 
@@ -854,7 +857,7 @@ private:
 				job->stage.store(1, std::memory_order_relaxed);
 				ok = m_executor.m_context.GetPipelineCache().GetGraphicsPrograms(
 				    job->registers, job->user_config, job->shaders, job->state, true,
-				    &job->prepared_resources);
+				    &job->prepared_resources, &job->vertex_tables);
 				job->stage.store(2, std::memory_order_relaxed);
 			}
 			job->prepared = ok;

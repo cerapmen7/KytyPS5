@@ -35,7 +35,8 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& input_info, std::vector<u
 
 // The preparers below fill an input info the caller value-initializes.
 ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,
-                            const HW::UserConfig& user_config, ShaderVertexInputInfo& input_info);
+                            const HW::UserConfig& user_config, ShaderVertexInputInfo& input_info,
+                            const ShaderVertexTables* tables = nullptr);
 // Each stage's tess holds the VGT fields; the caller adds the layout reflected from the programs.
 std::array<ShaderParams, 3>
 PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context& context,

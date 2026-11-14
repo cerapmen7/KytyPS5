@@ -17,6 +17,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -227,7 +228,8 @@ public:
 	// known yet; the caller then runs the synchronous path.
 	bool GetGraphicsPrograms(const HW::Context& context, const HW::UserConfig& user_config,
 	                         const HW::Shader& shaders, DrawRenderState& state, bool allow_async,
-	                         GraphicsPreparedResources* prepared = nullptr);
+	                         GraphicsPreparedResources* prepared = nullptr,
+	                         const ShaderVertexTables* tables = nullptr);
 	[[nodiscard]] bool UsesImageHeap(ShaderType stage, uint64_t hash) const;
 	// Null skips the dispatch.
 	const ShaderModule* GetComputeProgram(const HW::ComputeShaderInfo& regs,
@@ -245,7 +247,9 @@ private:
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		std::vector<ShaderModule>                    modules;
+		// Stable addresses: a preparation worker can hold a module pointer while the GPU
+		// thread appends another specialization for the same program.
+		std::deque<ShaderModule>                     modules;
 		bool                                         skip_dispatch = false;
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;

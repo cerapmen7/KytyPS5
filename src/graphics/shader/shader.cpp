@@ -16,6 +16,7 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderVertexMetadata.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
@@ -158,6 +159,46 @@ static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
 	}
 
 	EXIT("%s shader=0x%016" PRIx64 " is missing from ShaderMap\n", label, addr);
+}
+
+bool ShaderCaptureVertexTables(const HW::VertexShaderInfo& regs, ShaderVertexTables& out) {
+	out = {};
+	if (regs.es_regs.data_addr == 0) {
+		return false;
+	}
+	const auto entry = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderCaptureVertexTables():");
+	const auto& data = entry.data;
+	if (data.vertex_error != nullptr) {
+		return false;
+	}
+	const auto& metadata = data.vertex;
+	if (metadata.vertex_attrib_reg < 0) {
+		out.no_tables = true;
+		out.valid     = true;
+		return true;
+	}
+	const auto read_pointer = [&](int reg, uint64_t& address) {
+		if (reg < 0 || reg + 1 >= HW::UserSgprInfo::SGPRS_MAX) {
+			return false;
+		}
+		address = static_cast<uint64_t>(regs.gs_user_sgpr.value[reg]) |
+		          (static_cast<uint64_t>(regs.gs_user_sgpr.value[reg + 1]) << 32u);
+		return address != 0;
+	};
+	uint64_t attrib = 0;
+	uint64_t buffer = 0;
+	if (!read_pointer(metadata.vertex_attrib_reg, attrib) ||
+	    !read_pointer(metadata.vertex_buffer_reg, buffer)) {
+		return false;
+	}
+	if (!LibKernel::Memory::TryReadBufferBacking(attrib, out.attrib.data(),
+	                                             out.attrib.size() * sizeof(uint32_t)) ||
+	    !LibKernel::Memory::TryReadBufferBacking(buffer, out.buffer.data(),
+	                                             out.buffer.size() * sizeof(uint32_t))) {
+		return false;
+	}
+	out.valid = true;
+	return true;
 }
 
 static ShaderParams GetShaderParams(uint64_t shader_addr, uint64_t hash,
@@ -419,6 +460,7 @@ static uint32_t ShaderCalcPsSystemInputBase(const HW::ShaderRegisters& regs) {
 static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserSgprInfo& user_sgpr,
                                            uint32_t user_sgpr_num, const HW::ShaderRegisters& sh,
                                            const ShaderMapData&   data,
+                                           const ShaderVertexTables* tables,
                                            ShaderVertexInputInfo& info) {
 	KYTY_PROFILER_FUNCTION();
 	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::StaticInfo);
@@ -446,12 +488,20 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 		info.has_dynamic_vertex_fetch = true;
 		info.fetch_attrib_reg         = metadata.vertex_attrib_reg;
 		info.fetch_buffer_reg         = metadata.vertex_buffer_reg;
-		attrib = reinterpret_cast<const uint32_t*>(
-		    static_cast<uint64_t>(user_sgpr.value[metadata.vertex_attrib_reg]) |
-		    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_attrib_reg + 1]) << 32u));
-		buffer = reinterpret_cast<const uint32_t*>(
-		    static_cast<uint64_t>(user_sgpr.value[metadata.vertex_buffer_reg]) |
-		    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_buffer_reg + 1]) << 32u));
+		if (tables != nullptr) {
+			if (!tables->valid || tables->no_tables) {
+				return false;
+			}
+			attrib = tables->attrib.data();
+			buffer = tables->buffer.data();
+		} else {
+			attrib = reinterpret_cast<const uint32_t*>(
+			    static_cast<uint64_t>(user_sgpr.value[metadata.vertex_attrib_reg]) |
+			    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_attrib_reg + 1]) << 32u));
+			buffer = reinterpret_cast<const uint32_t*>(
+			    static_cast<uint64_t>(user_sgpr.value[metadata.vertex_buffer_reg]) |
+			    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_buffer_reg + 1]) << 32u));
+		}
 		if (attrib == nullptr || buffer == nullptr) {
 			LOGF("ShaderGetVertexInputInfo(): null vertex table pointer shader=0x%016" PRIx64 "\n",
 			     shader_addr);
@@ -768,7 +818,11 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 }
 
 ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,
-                            const HW::UserConfig& user_config, ShaderVertexInputInfo& info) {
+                            const HW::UserConfig& user_config, ShaderVertexInputInfo& info,
+                            const ShaderVertexTables* tables) {
+	if (tables != nullptr && !tables->valid) {
+		return {};
+	}
 	const auto& sh     = context.GetShaderRegisters();
 	const auto [data, hash] = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoVS():");
 	const bool merged = (context.GetShaderStages() & 0x20u) != 0;
@@ -781,7 +835,10 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	    merged || native_ngg ? 8u : 0u);
 	if (!merged && !native_ngg) {
 		if (!ShaderGetStaticVertexInputInfo(regs.es_regs.data_addr, regs.gs_user_sgpr,
-		                                    regs.gs_regs.rsrc2.user_sgpr, sh, data, info)) {
+		                                    regs.gs_regs.rsrc2.user_sgpr, sh, data, tables, info)) {
+			if (tables != nullptr) {
+				return {};
+			}
 			EXIT("failed to prepare vertex shader program\n");
 		}
 		info.wave_size = (context.GetShaderStages() & 0x00400000u) != 0 ? 32u : 64u;
@@ -883,7 +940,8 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	params[1].user_data[1] = static_cast<uint32_t>(regs.hs_regs.user_data_addr >> 32u);
 
 	if (!ShaderGetStaticVertexInputInfo(regs.ls_regs.data_addr, regs.hs_user_sgpr,
-	                                    regs.hs_regs.rsrc2.user_sgpr, sh, local, input_info[0])) {
+	                                    regs.hs_regs.rsrc2.user_sgpr, sh, local, nullptr,
+	                                    input_info[0])) {
 		EXIT("failed to prepare local shader program\n");
 	}
 	// LS and HS share the HS wave; the TES runs in the GS wave.

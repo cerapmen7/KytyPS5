@@ -344,6 +344,17 @@ struct ShaderMappedData {
 	std::shared_ptr<const std::vector<uint32_t>> host_code;
 };
 
+// Host copy of the two vertex fetch tables. Captured on the GPU thread at submit time so a
+// preparation worker never dereferences guest memory that can be unmapped.
+struct ShaderVertexTables {
+	std::array<uint32_t, ShaderVertexInputInfo::RES_MAX>     attrib {};
+	std::array<uint32_t, ShaderVertexInputInfo::RES_MAX * 4> buffer {};
+	bool                                                     no_tables = false;
+	bool                                                     valid     = false;
+};
+
+bool ShaderCaptureVertexTables(const HW::VertexShaderInfo& regs, ShaderVertexTables& out);
+
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
 uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
