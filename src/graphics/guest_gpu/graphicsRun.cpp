@@ -707,6 +707,18 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 
 		if (!Pm4KeepsPendingDraw(opcode)) {
+			static const bool async_debug = [] {
+				const auto* value = std::getenv("KYTY_ASYNC_DEBUG");
+				return value != nullptr && *value != '\0';
+			}();
+			if (async_debug && m_renderer.GetRenderExecutor().HasPendingDraw()) {
+				static std::array<std::atomic<uint32_t>, 256> seen {};
+				auto&                                        count = seen[opcode & 255u];
+				if (count.fetch_add(1, std::memory_order_relaxed) < 3) {
+					std::fprintf(stderr, "PM4 flush with pending draw opcode=0x%02x\n", opcode);
+					std::fflush(stderr);
+				}
+			}
 			m_renderer.GetRenderExecutor().FlushPendingDraw();
 		}
 		auto handler = g_cp_op_func[opcode];

@@ -8,6 +8,7 @@
 #include "graphics/shader/shaderBindings.h"
 
 #include <array>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -338,6 +339,9 @@ struct ShaderMappedData {
 	uint32_t        num_input_semantics = 0;
 	uint32_t        code_size_bytes     = 0;
 	uint32_t        scratch_size_dwords = 0;
+	// Host-owned copy of the shader binary. Guest modules can be unmapped while a draw
+	// preparation worker still reads the code or its embedded specialization data.
+	std::shared_ptr<const std::vector<uint32_t>> host_code;
 };
 
 void ShaderInit();

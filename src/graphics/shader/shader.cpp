@@ -111,6 +111,10 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	// Translation reads the bytes the hash covers.
 	mapped.code_size_bytes = ShaderProgramSize(binary, data.code_size_bytes);
 	const auto hash        = XXH3_64bits(binary, mapped.code_size_bytes);
+	// Keep a host copy so worker threads never read the guest mapping after it can be
+	// unmapped. The shader binary includes the embedded specialization data.
+	mapped.host_code = std::make_shared<const std::vector<uint32_t>>(
+	    binary, binary + mapped.code_size_bytes / sizeof(uint32_t));
 	mapped.vertex_error =
 	    ShaderReadVertexMetadata(data, HW::UserSgprInfo::SGPRS_MAX, mapped.vertex);
 	const auto semantics_count = mapped.vertex.input_semantics.size();
@@ -160,11 +164,16 @@ static ShaderParams GetShaderParams(uint64_t shader_addr, uint64_t hash,
 	                                std::span<const uint32_t> user_data,
 	                                const ShaderMappedData& data, uint32_t user_data_base = 0) {
 	const auto code_words = data.code_size_bytes / sizeof(uint32_t);
-	const auto code = std::span {reinterpret_cast<const uint32_t*>(shader_addr), code_words};
+	const auto* code_data =
+	    data.host_code != nullptr
+	        ? data.host_code->data()
+	        : reinterpret_cast<const uint32_t*>(shader_addr);
+	const auto code = std::span {code_data, code_words};
 	ShaderParams params {
 	    .code            = code,
 	    .user_data_count = static_cast<uint32_t>(user_data.size()) + user_data_base,
 	    .hash            = hash,
+	    .guest_base      = shader_addr,
 	};
 	EXIT_IF(user_data.size() > HW::UserSgprInfo::SGPRS_MAX ||
 	        params.user_data_count > params.user_data.size());

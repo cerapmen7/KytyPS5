@@ -36,6 +36,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
@@ -610,13 +611,30 @@ static std::optional<DrawEmitInfo> ResolveDrawEmit(const HW::UserConfig&        
                                                    const DrawIndirectArgs&      indirect);
 
 static bool DrawNeedsMetadataFlush(const CommandBuffer& buffer) {
-	const auto& hw = buffer.GetRegisters();
-	if (hw.GetColorControl().mode != 0) {
+	const auto& hw   = buffer.GetRegisters();
+	const auto  mode = hw.GetColorControl().mode;
+	// CbColorMode::Normal is 1 and is the ordinary draw path. Only the metadata,
+	// decompression and resolve modes mutate targets outside the draw's own recording.
+	if (mode == static_cast<uint8_t>(CbColorMode::EliminateFastClear) ||
+	    mode == static_cast<uint8_t>(CbColorMode::Resolve) ||
+	    mode == static_cast<uint8_t>(CbColorMode::FmaskDecompress) ||
+	    mode == static_cast<uint8_t>(CbColorMode::DccDecompress)) {
 		return true;
 	}
+	// DepthStencilCopy only acts when both the dirty and valid flags are set and the
+	// read/write addresses differ. The override flags alone are part of ordinary draw
+	// state, so treating them as a barrier flushed every draw and defeated batching.
+	const auto& z        = hw.GetDepthRenderTarget();
 	const auto& override = hw.GetDepthRenderOverride();
-	return override.force_z_dirty || override.force_z_valid || override.force_stencil_dirty ||
-	       override.force_stencil_valid;
+	const bool depth_copy = override.force_z_dirty && override.force_z_valid &&
+	                        z.z_info.format != Prospero::DepthFormat::kInvalid &&
+	                        z.z_read_base_addr != 0 && z.z_write_base_addr != 0 &&
+	                        z.z_read_base_addr != z.z_write_base_addr;
+	const bool stencil_copy = override.force_stencil_dirty && override.force_stencil_valid &&
+	                          z.stencil_info.format != Prospero::StencilFormat::kInvalid &&
+	                          z.stencil_read_base_addr != 0 && z.stencil_write_base_addr != 0 &&
+	                          z.stencil_read_base_addr != z.stencil_write_base_addr;
+	return depth_copy || stencil_copy;
 }
 
 static bool AsyncDrawPrepRequested() {
@@ -627,13 +645,29 @@ static bool AsyncDrawPrepRequested() {
 	return enabled;
 }
 
+// Batches the recording, but keeps preparation synchronous at flush time. Diagnostic step for
+// separating command-ordering problems from worker concurrency.
+static bool DeferDrawRequested() {
+	static const bool enabled = [] {
+		const auto* const value = std::getenv("KYTY_DEFER_DRAW");
+		return value != nullptr && *value != '\0' && std::strtoul(value, nullptr, 10) != 0;
+	}();
+	return enabled || AsyncDrawPrepRequested();
+}
+
 // A batch of draws whose shader stages are prepared by a small worker pool while the
 // GPU thread keeps decoding PM4. Each job owns its register/shader copies and resource
 // snapshots, so recording one draw cannot race a later draw with the same program.
 class DrawPrepQueue {
 public:
 	explicit DrawPrepQueue(RenderExecutor& executor): m_executor(executor) {
-		for (uint32_t i = 0; i < WorkerCount; i++) {
+		const uint32_t workers = [] {
+			const auto* value = std::getenv("KYTY_ASYNC_WORKERS");
+			return value != nullptr && *value != '\0'
+			           ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10))
+			           : 4u;
+		}();
+		for (uint32_t i = 0; i < workers; i++) {
 			m_workers.emplace_back([this](std::stop_token stop) { Run(stop); });
 		}
 	}
@@ -656,6 +690,7 @@ public:
 		job->indexed    = true;
 		job->index_args = args;
 		Enqueue(std::move(job));
+		MaybeFlush(buffer);
 	}
 	void SubmitAuto(CommandBuffer& buffer, const DrawCallInfo& draw, const DrawAutoArgs& args,
 	                DrawRenderState&& state, const DrawIndexBufferSource& index_source,
@@ -664,21 +699,66 @@ public:
 		job->indexed   = false;
 		job->auto_args = args;
 		Enqueue(std::move(job));
+		MaybeFlush(buffer);
 	}
 	[[nodiscard]] bool Pending() const noexcept { return !m_jobs.empty(); }
 
+	void MaybeFlush(CommandBuffer& buffer) {
+		static const size_t batch = [] {
+			const auto* value = std::getenv("KYTY_PREP_BATCH");
+			return value != nullptr && *value != '\0'
+			           ? static_cast<size_t>(std::strtoul(value, nullptr, 10))
+			           : size_t {8};
+		}();
+		if (batch != 0 && m_jobs.size() >= batch) {
+			Flush(buffer);
+		}
+	}
+
 	void Flush(CommandBuffer& buffer) {
 		if (m_jobs.empty()) {
+			m_next = 0;
+			m_done = 0;
 			return;
+		}		static const bool debug = [] {
+			const auto* value = std::getenv("KYTY_ASYNC_DEBUG");
+			return value != nullptr && *value != '\0';
+		}();
+		if (debug && m_flush_count < 32) {
+			std::fprintf(stderr, "FLUSH begin n=%u jobs=%zu next=%zu done=%zu\n", m_flush_count,
+			             m_jobs.size(), m_next, m_done);
+			std::fflush(stderr);
 		}
-		std::fprintf(stderr, "FLUSH start jobs=%zu done=%zu\n", m_jobs.size(), m_done);
-		std::fflush(stderr);
+		m_max_jobs = std::max<uint32_t>(m_max_jobs, static_cast<uint32_t>(m_jobs.size()));
 		{
 			std::unique_lock lock(m_mutex);
-			m_cv.wait(lock, [this] { return m_done == m_jobs.size() || m_stop; });
+			if (!m_cv.wait_for(lock, std::chrono::seconds(3),
+			                   [this] { return m_done >= m_jobs.size() || m_stop; })) {
+				std::fprintf(stderr, "ASYNC HANG jobs=%zu next=%zu done=%zu\n", m_jobs.size(),
+				             m_next, m_done);
+				for (size_t i = 0; i < m_jobs.size(); i++) {
+					const auto& job = *m_jobs[i];
+					std::fprintf(stderr,
+					             " job[%zu] stage=%d prepared=%d hash=%llx index_count=%u\n", i,
+					             job.stage.load(std::memory_order_relaxed), job.prepared ? 1 : 0,
+					             static_cast<unsigned long long>(
+					                 job.registers.GetShaderRegisters().m_cbShaderMask),
+					             job.index_args.index_count);
+				}
+				std::fflush(stderr);
+				std::abort();
+			}
 		}
-		std::fprintf(stderr, "FLUSH done jobs=%zu done=%zu\n", m_jobs.size(), m_done);
-		std::fflush(stderr);
+		if (debug && m_flush_count < 32) {
+			std::fprintf(stderr, "FLUSH end n=%u jobs=%zu done=%zu\n", m_flush_count, m_jobs.size(),
+			             m_done);
+			std::fflush(stderr);
+		}
+		if (++m_flush_count % 128 == 0) {
+			std::fprintf(stderr, "PREP flush n=%u max_jobs=%u\n", m_flush_count, m_max_jobs);
+			std::fflush(stderr);
+			m_max_jobs = 0;
+		}
 		for (auto& job: m_jobs) {
 			Record(buffer, *job);
 		}
@@ -688,8 +768,6 @@ public:
 	}
 
 private:
-	static constexpr uint32_t WorkerCount = 4;
-
 	struct Job {
 		HW::Context                     registers;
 		HW::UserConfig                  user_config;
@@ -701,6 +779,7 @@ private:
 		DrawIndexBufferSource           index_source;
 		std::vector<uint16_t>           expanded;
 		GraphicsPreparedResources       prepared_resources;
+		std::atomic<int>                stage {0};
 		bool                            prepared = false;
 		bool                            indexed  = true;
 	};
@@ -770,18 +849,21 @@ private:
 				}
 				job = m_jobs[m_next++].get();
 			}
-			std::fprintf(stderr, "WORK start hash=%llx\n",
-			             static_cast<unsigned long long>(job->registers.GetShaderRegisters().m_cbShaderMask));
-			std::fflush(stderr);
 			bool ok = false;
 			if (AsyncDrawPrepRequested()) {
+				job->stage.store(1, std::memory_order_relaxed);
 				ok = m_executor.m_context.GetPipelineCache().GetGraphicsPrograms(
 				    job->registers, job->user_config, job->shaders, job->state, true,
 				    &job->prepared_resources);
+				job->stage.store(2, std::memory_order_relaxed);
 			}
 			job->prepared = ok;
-			std::fprintf(stderr, "WORK done ok=%d\n", ok ? 1 : 0);
-			std::fflush(stderr);
+			job->stage.store(3, std::memory_order_relaxed);
+			{
+				std::lock_guard lock(m_mutex);
+				m_done++;
+				job->stage.store(4, std::memory_order_relaxed);
+			}
 			{
 				std::lock_guard lock(m_mutex);
 				m_done++;
@@ -797,6 +879,8 @@ private:
 	std::condition_variable               m_cv;
 	size_t                                m_next = 0;
 	size_t                                m_done = 0;
+	uint32_t                              m_max_jobs    = 0;
+	uint32_t                              m_flush_count = 0;
 	bool                                  m_stop = false;
 };
 
@@ -1754,7 +1838,7 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 
 	const DrawCallInfo draw {true, args.index_count, args.instance_count};
 	prefix.Stop();
-	if (!AsyncDrawPrepRequested()) {
+	if (!DeferDrawRequested()) {
 		if (!PrepareDrawRenderState(buffer, draw, state)) {
 			ResetBindings();
 			return true;
@@ -1838,7 +1922,7 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 		ResetBindings();
 		return true;
 	}
-	if (!AsyncDrawPrepRequested()) {
+	if (!DeferDrawRequested()) {
 		if (!PrepareDrawRenderState(buffer, draw, state)) {
 			ResetBindings();
 			return true;

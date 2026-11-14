@@ -19,6 +19,9 @@ struct ShaderParams {
 	std::array<uint32_t, 40>  user_data {}; // 32 user SGPRs plus the merged-stage s0:s7 prefix.
 	uint32_t                  user_data_count = 0;
 	uint64_t                  hash = 0;
+	// Guest address of the binary. Specialization reads resolve against guest memory;
+	// `code` may be a host copy so worker threads never touch an unmapped module.
+	uint64_t                  guest_base = 0;
 	std::span<const uint32_t> back_code;
 
 	[[nodiscard]] uint64_t Base() const {

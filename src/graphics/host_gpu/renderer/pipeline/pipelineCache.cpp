@@ -379,7 +379,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	const auto user_data = std::span(params.user_data).first(params.user_data_count);
 	ShaderRecompiler::IR::SrtRuntime runtime {
 	    .user_data                  = user_data,
-	    .shader_base                = params.Base(),
+	    .shader_base                = params.guest_base,
 	    .read_specialization_memory = ReadShaderGuestMemory,
 	    .image_heap                 = m_image_heap,
 	};
@@ -499,7 +499,7 @@ const ShaderModule* PipelineCache::GetPreparedProgram(
 	const auto       user_data = std::span(params.user_data).first(params.user_data_count);
 	ShaderRecompiler::IR::SrtRuntime runtime {
 	    .user_data                  = user_data,
-	    .shader_base                = params.Base(),
+	    .shader_base                = params.guest_base,
 	    .read_specialization_memory = ReadShaderGuestMemory,
 	    .image_heap                 = m_image_heap,
 	};
