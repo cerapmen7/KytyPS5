@@ -27,6 +27,13 @@ struct ShaderParams {
 	[[nodiscard]] uint64_t Base() const {
 		return reinterpret_cast<uint64_t>(code.data());
 	}
+	// Translation must see the guest bytes; the host copy is only for worker-side metadata.
+	[[nodiscard]] std::span<const uint32_t> CompileCode() const {
+		if (guest_base != 0 && !code.empty()) {
+			return {reinterpret_cast<const uint32_t*>(guest_base), code.size()};
+		}
+		return code;
+	}
 };
 
 void BuildStageStaticKey(const ShaderVertexInputInfo& input_info, std::vector<uint32_t>& key);

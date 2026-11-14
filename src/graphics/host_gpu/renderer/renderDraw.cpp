@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/workerSnapshot.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -655,6 +656,31 @@ static bool DeferDrawRequested() {
 	return enabled || AsyncDrawPrepRequested();
 }
 
+// Captures the guest pages that hold the user-data tables for this draw. The preparation
+// worker may only read these copies; anything outside makes it fall back to the GPU thread.
+static void CaptureWorkerGuestSnapshot(const HW::Shader& shaders, WorkerGuestSnapshot& snapshot) {
+	const auto capture_sgprs = [&snapshot](const HW::UserSgprInfo& user, uint32_t count,
+	                                       uint64_t user_data_addr) {
+		if (user_data_addr != 0) {
+			snapshot.Capture(user_data_addr, 1024);
+		}
+		const uint32_t pairs =
+		    std::min<uint32_t>(count, HW::UserSgprInfo::SGPRS_MAX) / 2u;
+		for (uint32_t pair = 0; pair < pairs; pair++) {
+			const uint64_t address = static_cast<uint64_t>(user.value[pair * 2u]) |
+			                         (static_cast<uint64_t>(user.value[pair * 2u + 1u]) << 32u);
+			if (address < 0x10000u || address > (uint64_t {1} << 48u)) {
+				continue;
+			}
+			snapshot.Capture(address, 1024);
+		}
+	};
+	const auto& vs = shaders.GetVs();
+	capture_sgprs(vs.gs_user_sgpr, vs.gs_regs.rsrc2.user_sgpr, vs.gs_regs.user_data_addr);
+	const auto& ps = shaders.GetPs();
+	capture_sgprs(ps.ps_user_sgpr, ps.ps_regs.rsrc2.user_sgpr, 0);
+}
+
 // A batch of draws whose shader stages are prepared by a small worker pool while the
 // GPU thread keeps decoding PM4. Each job owns its register/shader copies and resource
 // snapshots, so recording one draw cannot race a later draw with the same program.
@@ -780,6 +806,7 @@ private:
 		std::vector<uint16_t>           expanded;
 		GraphicsPreparedResources       prepared_resources;
 		ShaderVertexTables              vertex_tables;
+		WorkerGuestSnapshot             guest_snapshot;
 		std::atomic<int>                stage {0};
 		bool                            prepared = false;
 		bool                            indexed  = true;
@@ -809,6 +836,7 @@ private:
 		}
 		job->vertex_tables = {};
 		ShaderCaptureVertexTables(job->shaders.GetVs(), job->vertex_tables);
+		CaptureWorkerGuestSnapshot(job->shaders, job->guest_snapshot);
 		return job;
 	}
 
@@ -855,9 +883,11 @@ private:
 			bool ok = false;
 			if (AsyncDrawPrepRequested()) {
 				job->stage.store(1, std::memory_order_relaxed);
+				g_worker_guest_snapshot = &job->guest_snapshot;
 				ok = m_executor.m_context.GetPipelineCache().GetGraphicsPrograms(
 				    job->registers, job->user_config, job->shaders, job->state, true,
 				    &job->prepared_resources, &job->vertex_tables);
+				g_worker_guest_snapshot = nullptr;
 				job->stage.store(2, std::memory_order_relaxed);
 			}
 			job->prepared = ok;

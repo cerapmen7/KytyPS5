@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/workerSnapshot.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
@@ -114,6 +115,9 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 }
 
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
+	if (g_worker_guest_snapshot != nullptr) {
+		return g_worker_guest_snapshot->Read(address, values);
+	}
 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
 	return !values.empty() &&
@@ -444,10 +448,11 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 	options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
 	ShaderRecompiler::ShaderSource source;
+	const auto                      compile_code = params.CompileCode();
 	if (entry == m_program_cache.end()) {
-		DumpShader(params.code, fmt::format("original/{}_{:016x}.bin",
+		DumpShader(compile_code, fmt::format("original/{}_{:016x}.bin",
 		                                    ShaderRecompiler::StageName(options.stage), params.hash));
-		source = ShaderRecompiler::PrepareShaderSource(params.code, options);
+		source = ShaderRecompiler::PrepareShaderSource(compile_code, options);
 		if (source.unsupported_call_pc != UINT32_MAX) {
 			PipelineCacheLog("!!! TEMPORARY COMPUTE DISPATCH SKIP !!! shader=0x{:016x} pc=0x{:08x} "
 			                 "reason=unsupported GPU-selected callable target; rendering is incomplete",
@@ -467,7 +472,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			translated = ShaderRecompiler::TranslateProgram(current->decoded, options);
 		}
 	} else {
-		translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		translated = ShaderRecompiler::TranslateProgram(compile_code, options);
 	}
 	if (entry == m_program_cache.end()) {
 		auto retained = !source.calls.empty()
