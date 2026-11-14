@@ -978,6 +978,26 @@ bool PipelineCache::GetGraphicsPrograms(const HW::Context& context,
 		        ? GetPreparedProgram(pixel_params, pixel_info, push_data_cursor, prepared->pixel)
 		        : GetProgram(pixel_params, pixel_info, push_data_cursor, !allow_async);
 		if (pixel_program == nullptr) {
+			static const bool debug = [] {
+				const auto* value = std::getenv("KYTY_ASYNC_DEBUG");
+				return value != nullptr && *value != '\0';
+			}();
+			if (debug) {
+				const auto entry = m_program_cache.find(m_lookup_key);
+				std::fprintf(stderr,
+				             "PS NULL async=%d prepared=%d hash=%llx entry=%d modules=%zu "
+				             "skip=%d call=%d code_empty=%d user_data=%u\n",
+				             allow_async ? 1 : 0, prepared != nullptr ? 1 : 0,
+				             static_cast<unsigned long long>(pixel_params.hash),
+				             entry == m_program_cache.end() ? 0 : 1,
+				             entry == m_program_cache.end() ? 0 : entry->second.modules.size(),
+				             entry == m_program_cache.end() ? 0 : (entry->second.skip_dispatch ? 1 : 0),
+				             entry == m_program_cache.end()
+				                 ? 0
+				                 : (entry->second.call_source != nullptr ? 1 : 0),
+				             pixel_params.code.empty() ? 1 : 0, pixel_params.user_data_count);
+				std::fflush(stderr);
+			}
 			return false;
 		}
 		const auto& pixel_module = *pixel_program;
