@@ -656,6 +656,16 @@ static bool DeferDrawRequested() {
 	return enabled || AsyncDrawPrepRequested();
 }
 
+// Diagnostic: compile the programs while the guest shader bytes are still mapped, before
+// the draw is deferred. The worker then only has to find the cached modules.
+static bool PrecompileDeferRequested() {
+	static const bool enabled = [] {
+		const auto* const value = std::getenv("KYTY_PRECOMPILE_DEFER");
+		return value != nullptr && *value != '\0' && std::strtoul(value, nullptr, 10) != 0;
+	}();
+	return enabled;
+}
+
 // Captures the guest pages that hold the user-data tables for this draw. The preparation
 // worker may only read these copies; anything outside makes it fall back to the GPU thread.
 static void CaptureWorkerGuestSnapshot(const HW::Shader& shaders, WorkerGuestSnapshot& snapshot) {
@@ -1886,6 +1896,10 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 		ResetBindings();
 		return emit.has_value();
 	}
+	if (PrecompileDeferRequested()) {
+		DrawRenderState compile_state;
+		m_context.GetPipelineCache().GetGraphicsPrograms(buffer, compile_state);
+	}
 	GetDrawPrep().SubmitIndex(buffer, draw, args, std::move(state), index_source,
 	                          std::move(expanded_indices));
 	return true;
@@ -1976,6 +1990,10 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 		}
 		ResetBindings();
 		return emit.has_value();
+	}
+	if (PrecompileDeferRequested()) {
+		DrawRenderState compile_state;
+		m_context.GetPipelineCache().GetGraphicsPrograms(buffer, compile_state);
 	}
 	GetDrawPrep().SubmitAuto(buffer, draw, args, std::move(state), {}, {});
 	return true;
