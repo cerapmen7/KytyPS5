@@ -871,13 +871,15 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			}
 			// A CPU write does not always mean new bytes: the scene rewrites the same static
 			// constants every frame. Compare the content before paying for an upload and a
-			// descriptor rewrite. GPU-owned ranges are not read (that would force a download).
+			// descriptor rewrite. Ranges on GPU-written pages are not read: those pages are
+			// protected, so the read would fault and wait for a download (or for one in flight)
+			// on this thread, which costs far more than the upload the hash may save.
 			uint64_t pending_hash  = 0;
 			bool     pending_valid = false;
 			if (entry.valid && entry.source == source && source.address != 0 && source.size != 0 &&
 			    source.size <= 8ull * 1024 * 1024 && !resource.written && !formatted &&
 			    buffer_cache.IsRegionCpuModified(source.address, source.size) &&
-			    !buffer_cache.HasGpuDirtyBytes(source.address, source.size)) {
+			    !buffer_cache.IsRegionGpuModified(source.address, source.size)) {
 				pending_hash = XXH3_64bits(reinterpret_cast<const void*>(source.address), source.size);
 				pending_valid = true;
 				if (entry.hash_valid && entry.content_hash == pending_hash) {

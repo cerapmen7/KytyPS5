@@ -431,6 +431,36 @@ struct Context {
 			ymm[index] = {};
 		}
 	}
+
+	// Writes bits 255:128 of YMM`index`. Fails when the saved context has no extended state.
+	[[nodiscard]] bool SetUpperYmm(uint8_t index, const void* upper) const {
+		if ((native->ContextFlags & CONTEXT_XSTATE) != CONTEXT_XSTATE) {
+			return false;
+		}
+		DWORD64 features = 0;
+		if (!GetXStateFeaturesMask(native, &features)) {
+			return false;
+		}
+		DWORD size = 0;
+		if ((features & XSTATE_MASK_AVX) == 0) {
+			// The AVX component was in its init state (all upper halves zero): enable it and
+			// write those zeroes explicitly before setting one half.
+			if (!SetXStateFeaturesMask(native, features | XSTATE_MASK_AVX)) {
+				return false;
+			}
+			auto* all = static_cast<M128A*>(LocateXStateFeature(native, XSTATE_AVX, &size));
+			if (all == nullptr || size < 16u * sizeof(M128A)) {
+				return false;
+			}
+			std::memset(all, 0, 16u * sizeof(M128A));
+		}
+		auto* ymm = static_cast<M128A*>(LocateXStateFeature(native, XSTATE_AVX, &size));
+		if (ymm == nullptr || size < (index + 1u) * sizeof(M128A)) {
+			return false;
+		}
+		std::memcpy(&ymm[index], upper, sizeof(M128A));
+		return true;
+	}
 #elif defined(__APPLE__)
 	ucontext_t* native;
 
@@ -837,6 +867,433 @@ bool TryEmulate(void* native_context) {
 	       TryEmulateShaNi(context) ||
 #endif
 	       TryEmulateCpuExtensions(context);
+}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// Arithmetic flags of `a - b` (CMP) or `a & b` (TEST) at the given operand width.
+static uint64_t ArithmeticFlags(uint64_t a, uint64_t b, uint32_t size, bool test) {
+	uint64_t flags = 0;
+	switch (size) {
+		case 1: {
+			const auto x = static_cast<uint8_t>(a);
+			const auto y = static_cast<uint8_t>(b);
+			if (test) {
+				__asm__ volatile("testb %b2, %b1\n\tpushfq\n\tpopq %0"
+				                 : "=r"(flags)
+				                 : "q"(x), "q"(y)
+				                 : "cc");
+			} else {
+				__asm__ volatile("cmpb %b2, %b1\n\tpushfq\n\tpopq %0"
+				                 : "=r"(flags)
+				                 : "q"(x), "q"(y)
+				                 : "cc");
+			}
+			break;
+		}
+		case 2: {
+			const auto x = static_cast<uint16_t>(a);
+			const auto y = static_cast<uint16_t>(b);
+			if (test) {
+				__asm__ volatile("testw %w2, %w1\n\tpushfq\n\tpopq %0"
+				                 : "=r"(flags)
+				                 : "r"(x), "r"(y)
+				                 : "cc");
+			} else {
+				__asm__ volatile("cmpw %w2, %w1\n\tpushfq\n\tpopq %0"
+				                 : "=r"(flags)
+				                 : "r"(x), "r"(y)
+				                 : "cc");
+			}
+			break;
+		}
+		case 4: {
+			const auto x = static_cast<uint32_t>(a);
+			const auto y = static_cast<uint32_t>(b);
+			if (test) {
+				__asm__ volatile("testl %k2, %k1\n\tpushfq\n\tpopq %0"
+				                 : "=r"(flags)
+				                 : "r"(x), "r"(y)
+				                 : "cc");
+			} else {
+				__asm__ volatile("cmpl %k2, %k1\n\tpushfq\n\tpopq %0"
+				                 : "=r"(flags)
+				                 : "r"(x), "r"(y)
+				                 : "cc");
+			}
+			break;
+		}
+		default: {
+			if (test) {
+				__asm__ volatile("testq %2, %1\n\tpushfq\n\tpopq %0"
+				                 : "=r"(flags)
+				                 : "r"(a), "r"(b)
+				                 : "cc");
+			} else {
+				__asm__ volatile("cmpq %2, %1\n\tpushfq\n\tpopq %0"
+				                 : "=r"(flags)
+				                 : "r"(a), "r"(b)
+				                 : "cc");
+			}
+			break;
+		}
+	}
+	return flags;
+}
+
+static uint64_t SignExtend(uint64_t value, uint32_t bytes) {
+	switch (bytes) {
+		case 1: return static_cast<uint64_t>(static_cast<int64_t>(static_cast<int8_t>(value)));
+		case 2: return static_cast<uint64_t>(static_cast<int64_t>(static_cast<int16_t>(value)));
+		case 4: return static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(value)));
+		default: return value;
+	}
+}
+
+static uint64_t Truncate(uint64_t value, uint32_t bytes) {
+	return bytes >= 8 ? value : value & ((uint64_t {1} << (bytes * 8u)) - 1u);
+}
+
+static bool IsHighByteRegister(ZydisRegister reg) {
+	return reg == ZYDIS_REGISTER_AH || reg == ZYDIS_REGISTER_CH || reg == ZYDIS_REGISTER_DH ||
+	       reg == ZYDIS_REGISTER_BH;
+}
+
+// Writes a GPR the way the CPU does: 32-bit writes zero the upper half, 8/16-bit writes merge.
+static bool WriteGpr(Context& context, ZydisRegister reg, uint64_t value) {
+	const auto reg_class = ZydisRegisterGetClass(reg);
+	const auto id        = ZydisRegisterGetId(reg);
+	if (id < 0 || id >= 16 || IsHighByteRegister(reg)) {
+		return false;
+	}
+	auto& target = context.Gpr(static_cast<uint8_t>(id));
+	switch (reg_class) {
+		case ZYDIS_REGCLASS_GPR64: target = value; return true;
+		case ZYDIS_REGCLASS_GPR32: target = static_cast<uint32_t>(value); return true;
+		case ZYDIS_REGCLASS_GPR16:
+			target = (target & ~uint64_t {0xffff}) | (value & 0xffffu);
+			return true;
+		case ZYDIS_REGCLASS_GPR8:
+			target = (target & ~uint64_t {0xff}) | (value & 0xffu);
+			return true;
+		default: return false;
+	}
+}
+
+// `a op b` for the two-operand ALU forms with a 32- or 64-bit register destination. The host CPU
+// computes the result and the flags, so they match the instruction exactly.
+static bool AluOp(ZydisMnemonic mnemonic, uint64_t a, uint64_t b, uint32_t size, uint64_t& result,
+                  uint64_t& flags) {
+#define KYTY_SERVED_ALU(op)                                                                        \
+	if (size == 8) {                                                                               \
+		uint64_t r = a;                                                                            \
+		__asm__ volatile(op "q %2, %0\n\tpushfq\n\tpopq %1"                                        \
+		                 : "+r"(r), "=&r"(flags)                                                   \
+		                 : "r"(b)                                                                  \
+		                 : "cc");                                                                  \
+		result = r;                                                                                \
+		return true;                                                                               \
+	}                                                                                              \
+	if (size == 4) {                                                                               \
+		uint32_t       r = static_cast<uint32_t>(a);                                               \
+		const uint32_t y = static_cast<uint32_t>(b);                                               \
+		__asm__ volatile(op "l %2, %0\n\tpushfq\n\tpopq %1"                                        \
+		                 : "+r"(r), "=&r"(flags)                                                   \
+		                 : "r"(y)                                                                  \
+		                 : "cc");                                                                  \
+		result = r;                                                                                \
+		return true;                                                                               \
+	}                                                                                              \
+	return false;
+	switch (mnemonic) {
+		case ZYDIS_MNEMONIC_ADD: {
+			KYTY_SERVED_ALU("add")
+		}
+		case ZYDIS_MNEMONIC_SUB: {
+			KYTY_SERVED_ALU("sub")
+		}
+		case ZYDIS_MNEMONIC_AND: {
+			KYTY_SERVED_ALU("and")
+		}
+		case ZYDIS_MNEMONIC_OR: {
+			KYTY_SERVED_ALU("or")
+		}
+		case ZYDIS_MNEMONIC_XOR: {
+			KYTY_SERVED_ALU("xor")
+		}
+		default: return false;
+	}
+#undef KYTY_SERVED_ALU
+}
+
+static bool ReadGpr(Context& context, ZydisRegister reg, uint64_t& value) {
+	const auto reg_class = ZydisRegisterGetClass(reg);
+	const auto id        = ZydisRegisterGetId(reg);
+	if (id < 0 || id >= 16 || IsHighByteRegister(reg)) {
+		return false;
+	}
+	const auto full = static_cast<uint64_t>(context.Gpr(static_cast<uint8_t>(id)));
+	switch (reg_class) {
+		case ZYDIS_REGCLASS_GPR64: value = full; return true;
+		case ZYDIS_REGCLASS_GPR32: value = static_cast<uint32_t>(full); return true;
+		case ZYDIS_REGCLASS_GPR16: value = full & 0xffffu; return true;
+		case ZYDIS_REGCLASS_GPR8: value = full & 0xffu; return true;
+		default: return false;
+	}
+}
+#endif
+
+bool TryEmulateServedLoad(void* native_context, uint64_t fault_address, ServeReadFunc serve,
+                          uint32_t* mnemonic_out) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (native_context == nullptr || serve == nullptr) {
+		return false;
+	}
+	Context                 context {static_cast<PCONTEXT>(native_context)};
+	ZydisDecoder            decoder {};
+	ZydisDecodedInstruction instruction {};
+	ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT] {};
+	if (!ZYAN_SUCCESS(
+	        ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64)) ||
+	    !ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, reinterpret_cast<const void*>(context.Rip()),
+	                                         ZYDIS_MAX_INSTRUCTION_LENGTH, &instruction,
+	                                         operands))) {
+		return false;
+	}
+	if (mnemonic_out != nullptr) {
+		*mnemonic_out = static_cast<uint32_t>(instruction.mnemonic);
+	}
+	if ((instruction.attributes & (ZYDIS_ATTRIB_HAS_LOCK | ZYDIS_ATTRIB_HAS_REP |
+	                               ZYDIS_ATTRIB_HAS_REPE | ZYDIS_ATTRIB_HAS_REPNE)) != 0) {
+		return false;
+	}
+	// Exactly one explicit memory operand, read and never written.
+	int memory_index = -1;
+	for (uint8_t i = 0; i < instruction.operand_count_visible; ++i) {
+		if (operands[i].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+			if (memory_index >= 0) {
+				return false;
+			}
+			memory_index = i;
+		}
+	}
+	if (memory_index < 0) {
+		return false;
+	}
+	const auto& memory = operands[memory_index];
+	if ((memory.actions & ZYDIS_OPERAND_ACTION_MASK_WRITE) != 0 ||
+	    memory.mem.type != ZYDIS_MEMOP_TYPE_MEM || memory.mem.segment == ZYDIS_REGISTER_FS ||
+	    memory.mem.segment == ZYDIS_REGISTER_GS) {
+		return false;
+	}
+	ZydisRegisterContext registers {};
+	for (uint8_t i = 0; i < 16; ++i) {
+		const auto value                         = static_cast<uint64_t>(context.Gpr(i));
+		registers.values[ZYDIS_REGISTER_RAX + i] = value;
+		registers.values[ZYDIS_REGISTER_EAX + i] = static_cast<uint32_t>(value);
+	}
+	uint64_t address = 0;
+	if (!ZYAN_SUCCESS(ZydisCalcAbsoluteAddressEx(&instruction, &memory, context.Rip(), &registers,
+	                                             &address))) {
+		return false;
+	}
+	const uint32_t size = memory.size / 8u;
+	if (size == 0 || size > 32 || fault_address < address || fault_address >= address + size) {
+		return false;
+	}
+
+	alignas(32) uint8_t bytes[32] {};
+	uint64_t            scalar      = 0;
+	const auto          load        = [&] { return serve(address, size, bytes); };
+	const auto          load_scalar = [&] {
+        if (size > 8 || !load()) {
+            return false;
+        }
+        std::memcpy(&scalar, bytes, size);
+        return true;
+	};
+
+	const auto& dst      = operands[0];
+	const bool  vex      = instruction.encoding == ZYDIS_INSTRUCTION_ENCODING_VEX;
+	const auto  mnemonic = instruction.mnemonic;
+	switch (mnemonic) {
+		case ZYDIS_MNEMONIC_MOV:
+			if (memory_index != 1 || dst.type != ZYDIS_OPERAND_TYPE_REGISTER ||
+			    ZydisRegisterGetClass(dst.reg.value) == ZYDIS_REGCLASS_SEGMENT || !load_scalar() ||
+			    !WriteGpr(context, dst.reg.value, scalar)) {
+				return false;
+			}
+			break;
+		case ZYDIS_MNEMONIC_MOVZX:
+			if (memory_index != 1 || dst.type != ZYDIS_OPERAND_TYPE_REGISTER || !load_scalar() ||
+			    !WriteGpr(context, dst.reg.value, Truncate(scalar, size))) {
+				return false;
+			}
+			break;
+		case ZYDIS_MNEMONIC_MOVSX:
+		case ZYDIS_MNEMONIC_MOVSXD:
+			if (memory_index != 1 || dst.type != ZYDIS_OPERAND_TYPE_REGISTER || !load_scalar() ||
+			    !WriteGpr(context, dst.reg.value, SignExtend(scalar, size))) {
+				return false;
+			}
+			break;
+		case ZYDIS_MNEMONIC_CMP:
+		case ZYDIS_MNEMONIC_TEST: {
+			if (instruction.operand_count_visible != 2) {
+				return false;
+			}
+			const auto& other       = operands[memory_index == 0 ? 1 : 0];
+			uint64_t    other_value = 0;
+			if (other.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+				other_value = other.imm.is_signed ? static_cast<uint64_t>(other.imm.value.s)
+				                                  : other.imm.value.u;
+			} else if (other.type != ZYDIS_OPERAND_TYPE_REGISTER ||
+			           !ReadGpr(context, other.reg.value, other_value)) {
+				return false;
+			}
+			if (!load_scalar()) {
+				return false;
+			}
+			const uint64_t     a          = memory_index == 0 ? scalar : other_value;
+			const uint64_t     b          = memory_index == 0 ? other_value : scalar;
+			const auto         flags      = ArithmeticFlags(a, b, size, mnemonic == ZYDIS_MNEMONIC_TEST);
+			constexpr uint32_t arithmetic = 0x8d5u;
+			context.native->EFlags = (context.native->EFlags & ~arithmetic) |
+			                         (static_cast<uint32_t>(flags) & arithmetic);
+			break;
+		}
+		case ZYDIS_MNEMONIC_ADD:
+		case ZYDIS_MNEMONIC_SUB:
+		case ZYDIS_MNEMONIC_AND:
+		case ZYDIS_MNEMONIC_OR:
+		case ZYDIS_MNEMONIC_XOR: {
+			// Only `reg op= [mem]`; the memory-destination forms write memory and were refused.
+			if (memory_index != 1 || instruction.operand_count_visible != 2 ||
+			    dst.type != ZYDIS_OPERAND_TYPE_REGISTER || (size != 4 && size != 8)) {
+				return false;
+			}
+			uint64_t a = 0;
+			if (!ReadGpr(context, dst.reg.value, a) || !load_scalar()) {
+				return false;
+			}
+			uint64_t result = 0;
+			uint64_t flags  = 0;
+			if (!AluOp(mnemonic, a, scalar, size, result, flags) ||
+			    !WriteGpr(context, dst.reg.value, result)) {
+				return false;
+			}
+			constexpr uint32_t arithmetic = 0x8d5u;
+			context.native->EFlags = (context.native->EFlags & ~arithmetic) |
+			                         (static_cast<uint32_t>(flags) & arithmetic);
+			break;
+		}
+		case ZYDIS_MNEMONIC_BEXTR: {
+			// BMI1 `bextr dst, [mem], ctrl`: start = ctrl[7:0], length = ctrl[15:8].
+			const auto& control = operands[2];
+			if (memory_index != 1 || instruction.operand_count_visible != 3 ||
+			    dst.type != ZYDIS_OPERAND_TYPE_REGISTER ||
+			    control.type != ZYDIS_OPERAND_TYPE_REGISTER || (size != 4 && size != 8)) {
+				return false;
+			}
+			uint64_t ctrl = 0;
+			if (!ReadGpr(context, control.reg.value, ctrl) || !load_scalar()) {
+				return false;
+			}
+			const uint32_t bits   = size * 8u;
+			const uint32_t start  = static_cast<uint32_t>(ctrl & 0xffu);
+			const uint32_t length = static_cast<uint32_t>((ctrl >> 8u) & 0xffu);
+			uint64_t       result = 0;
+			if (start < bits && length != 0) {
+				result = Truncate(scalar, size) >> start;
+				if (length < 64) {
+					result &= (uint64_t {1} << length) - 1u;
+				}
+			}
+			if (!WriteGpr(context, dst.reg.value, result)) {
+				return false;
+			}
+			// ZF from the result, CF = OF = 0; the other flags are undefined and kept.
+			constexpr uint32_t cf = 0x1u;
+			constexpr uint32_t zf = 0x40u;
+			constexpr uint32_t of = 0x800u;
+			context.native->EFlags = (context.native->EFlags & ~(cf | zf | of)) |
+			                         (result == 0 ? zf : 0u);
+			break;
+		}
+		case ZYDIS_MNEMONIC_MOVSS:
+		case ZYDIS_MNEMONIC_MOVSD:
+		case ZYDIS_MNEMONIC_MOVD:
+		case ZYDIS_MNEMONIC_MOVQ:
+		case ZYDIS_MNEMONIC_MOVUPS:
+		case ZYDIS_MNEMONIC_MOVAPS:
+		case ZYDIS_MNEMONIC_MOVUPD:
+		case ZYDIS_MNEMONIC_MOVAPD:
+		case ZYDIS_MNEMONIC_MOVDQU:
+		case ZYDIS_MNEMONIC_MOVDQA:
+		case ZYDIS_MNEMONIC_LDDQU:
+		case ZYDIS_MNEMONIC_VMOVSS:
+		case ZYDIS_MNEMONIC_VMOVSD:
+		case ZYDIS_MNEMONIC_VMOVD:
+		case ZYDIS_MNEMONIC_VMOVQ:
+		case ZYDIS_MNEMONIC_VMOVUPS:
+		case ZYDIS_MNEMONIC_VMOVAPS:
+		case ZYDIS_MNEMONIC_VMOVUPD:
+		case ZYDIS_MNEMONIC_VMOVAPD:
+		case ZYDIS_MNEMONIC_VMOVDQU:
+		case ZYDIS_MNEMONIC_VMOVDQA:
+		case ZYDIS_MNEMONIC_VLDDQU: {
+			// Only the two-operand load forms into an XMM register, or a full VEX load into YMM.
+			if (memory_index != 1 || instruction.operand_count_visible != 2 ||
+			    dst.type != ZYDIS_OPERAND_TYPE_REGISTER) {
+				return false;
+			}
+			if (vex && size == 32 && ZydisRegisterGetClass(dst.reg.value) == ZYDIS_REGCLASS_YMM &&
+			    (mnemonic == ZYDIS_MNEMONIC_VMOVUPS || mnemonic == ZYDIS_MNEMONIC_VMOVAPS ||
+			     mnemonic == ZYDIS_MNEMONIC_VMOVUPD || mnemonic == ZYDIS_MNEMONIC_VMOVAPD ||
+			     mnemonic == ZYDIS_MNEMONIC_VMOVDQU || mnemonic == ZYDIS_MNEMONIC_VMOVDQA ||
+			     mnemonic == ZYDIS_MNEMONIC_VLDDQU)) {
+				const auto id = ZydisRegisterGetId(dst.reg.value);
+				if (id < 0 || id >= 16 || !load()) {
+					return false;
+				}
+				auto* xmm = context.Xmm(static_cast<uint8_t>(id));
+				// The upper half first: it is the only step that can fail.
+				if (xmm == nullptr || !context.SetUpperYmm(static_cast<uint8_t>(id), bytes + 16)) {
+					return false;
+				}
+				std::memcpy(xmm, bytes, 16);
+				break;
+			}
+			if (ZydisRegisterGetClass(dst.reg.value) != ZYDIS_REGCLASS_XMM) {
+				return false;
+			}
+			const auto id = ZydisRegisterGetId(dst.reg.value);
+			if (id < 0 || id >= 16 || (size != 4 && size != 8 && size != 16) || !load()) {
+				return false;
+			}
+			auto* xmm = context.Xmm(static_cast<uint8_t>(id));
+			if (xmm == nullptr) {
+				return false;
+			}
+			// Scalar and full loads both zero the rest of the 128-bit register.
+			alignas(16) uint8_t value[16] {};
+			std::memcpy(value, bytes, size);
+			std::memcpy(xmm, value, sizeof(value));
+			if (vex) {
+				context.ClearUpperYmm(static_cast<uint8_t>(id));
+			}
+			break;
+		}
+		default: return false;
+	}
+	context.Advance(instruction.length);
+	return true;
+#else
+	(void)native_context;
+	(void)fault_address;
+	(void)serve;
+	(void)mnemonic_out;
+	return false;
+#endif
 }
 
 void SkipLoad(void* native_context, size_t length) {

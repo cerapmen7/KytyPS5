@@ -54,6 +54,10 @@ public:
 	OcclusionQueries&   GetOcclusionQueries() { return m_occlusion_queries; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+	// Serves a guest read of bytes that share a GPU-written page but were never written by the
+	// GPU: copies them from the unprotected backing into `out`. Returns false to keep the
+	// normal download path (GPU-dirty bytes, images, unmapped or untracked memory).
+	[[nodiscard]] bool TryReadCpuOwned(uint64_t vaddr, uint64_t size, void* out) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);

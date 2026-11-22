@@ -14,9 +14,11 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
+#include <condition_variable>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <span>
 #include <utility>
 #include <vector>
@@ -85,6 +87,10 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	template <class Func>
+	void ForEachGpuDirty(uint64_t vaddr, uint64_t size, Func&& func) const {
+		m_gpu_modified_ranges.ForEachInRange(vaddr, size, func);
+	}
 	[[nodiscard]] bool HasOnlyGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
@@ -108,6 +114,15 @@ public:
 	void               DecayReadHot();
 	void               SupersedeAllPublishes();
 	void               SupersedePublishes(uint64_t vaddr, uint64_t size);
+
+	// KYTY_SERVE_CPU_READS=1: a guest read that faults on a GPU-written page but touches none of
+	// the GPU-written bytes is served from the backing store by the fault handler, without a
+	// download (which waits for all queued GPU work). Read once at startup.
+	[[nodiscard]] static bool ServeCpuReadsEnabled() noexcept;
+	// Any thread. True when no byte of the range is GPU-dirty or under a download that is not
+	// published yet, and the range's 4 KiB page holds GPU-dirty bytes (so the fault came from
+	// them). The backing store then holds the current value of every byte of the range.
+	[[nodiscard]] bool CanServeCpuRead(uint64_t vaddr, uint64_t size) const;
 
 private:
 	struct PublishEntry {
@@ -165,6 +180,8 @@ private:
 		// Owns the memory behind mapped when the stream buffer was too full to serve it. The
 		// downloads of one batch share it, because the batch makes a single reservation.
 		std::shared_ptr<Buffer> temporary;
+		// Served-read mirror entry that covers the collected bytes until they are published.
+		uint64_t serve_id = 0;
 	};
 	[[nodiscard]] PendingDownload CollectDownloadCopies(const Buffer& buffer, uint64_t vaddr,
 	                                                    uint64_t size);
@@ -244,6 +261,65 @@ private:
 	std::vector<std::shared_ptr<PublishBatch>>        m_inflight_publishes;
 	uint64_t                                          m_hot_flip = 0;
 	uint32_t                                          m_publish_slices = 0;
+
+public:
+	// Lab trace: tick current when each 4 KiB page was last bound for a GPU write. Direct-mapped,
+	// so a lookup can miss (returns 0). Only maintained in KYTY_PROBE_LITE mode.
+	void     NoteWriteTick(uint64_t vaddr, uint64_t size);
+	uint64_t MaxWriteTick(uint64_t vaddr, uint64_t size) const;
+
+private:
+	struct WriteTickEntry {
+		uint64_t page = 0;
+		uint64_t tick = 0;
+	};
+	static constexpr size_t WriteTickSlots = size_t {1} << 16u;
+	std::unique_ptr<WriteTickEntry[]> m_write_ticks;
+
+	// Served-read mirror, written by the GPU thread and read by faulting guest threads. It is a
+	// superset of the bytes whose backing may be stale: m_serve_dirty follows
+	// m_gpu_modified_ranges, and a collected download stays in m_serve_inflight until its bytes
+	// are written to the backing (the GPU-dirty set drops them when they are collected).
+	struct ServeInflight {
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+		uint64_t id    = 0;
+	};
+	void ServeMarkDirty(uint64_t vaddr, uint64_t size);
+	void ServeClearDirty(uint64_t vaddr, uint64_t size);
+	void ServeEndInflight(uint64_t id);
+	mutable std::shared_mutex  m_serve_mutex;
+	RangeSet                   m_serve_dirty;
+	std::vector<ServeInflight> m_serve_inflight;
+	uint64_t                   m_serve_next_id = 1;
+
+	// KYTY_ASYNC_READBACK=1: a download a guest thread needs is recorded and submitted by the GPU
+	// thread, published by the priority thread once the GPU is done, and waited for by the guest
+	// thread only. The GPU thread keeps processing meanwhile instead of waiting for all queued
+	// GPU work. The window's pages stay protected until the download is published.
+	struct AsyncReadback {
+		std::mutex              mutex;
+		std::condition_variable published;
+		bool                    done           = false;
+		uint64_t                start          = 0;
+		uint64_t                size           = 0;
+		uint64_t                buffer_address = 0;
+		uint64_t                buffer_size    = 0;
+	};
+	[[nodiscard]] static bool AsyncReadbacksEnabled() noexcept;
+	// Guest-thread entry. Returns false when the synchronous path must handle the request.
+	[[nodiscard]] bool ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write);
+	// GPU thread only.
+	[[nodiscard]] std::shared_ptr<AsyncReadback> FindAsyncReadback(uint64_t vaddr,
+	                                                               uint64_t size) const;
+	[[nodiscard]] bool AsyncReadbackIntersects(uint64_t vaddr, uint64_t size) const;
+	// GPU thread: waits for the download's publish if needed, retires it and unprotects its clean
+	// pages. Idempotent.
+	void FinishAsyncReadback(const std::shared_ptr<AsyncReadback>& state);
+	// GPU thread: unprotects the tracker pages of a range that hold no GPU-dirty byte and no byte
+	// of an unpublished asynchronous download.
+	void UnmarkCleanPages(uint64_t vaddr, uint64_t size);
+	std::vector<std::shared_ptr<AsyncReadback>> m_async_readbacks;
 };
 
 } // namespace Libs::Graphics

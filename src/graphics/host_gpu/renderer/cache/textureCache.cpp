@@ -1206,7 +1206,9 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		Common::DebugCounters::ScopedTimer timer(
 		    Common::DebugCounters::Counter::ColorMetadataReadbacks,
 		    Common::DebugCounters::Counter::ColorMetadataReadbackNs);
+		Common::PerfProbe::FaultRipRef() = 2; // trace tag: color metadata readback
 		m_buffer_cache.ReadMemory(viewed.address, viewed.size, false);
+		Common::PerfProbe::FaultRipRef() = 0;
 	}
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = run(slice);

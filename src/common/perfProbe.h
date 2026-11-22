@@ -16,10 +16,12 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <mutex>
 #include <string>
 
 namespace Common::PerfProbe {
@@ -120,6 +122,26 @@ enum class Slot : uint32_t {
 	WaitFault,
 	WaitOccl,
 	StaticDecode,
+	GpuIdle,
+	GpuBlocked,
+	IrqDelay,
+	RwEq,
+	RwSema,
+	RwEvf,
+	RwCond,
+	RwSleep,
+	RwMutex,
+	RwAddr,
+	AnyEq,
+	AnyCondTimed,
+	ServedReads,
+	UnservedReads,
+	ServeNotGpuPage,
+	ServeGpuBytes,
+	ServeWriteBack,
+	FaultRead,
+	FaultWrite,
+	AsyncDlWait,
 	Count,
 };
 
@@ -148,6 +170,10 @@ inline const char* Name(Slot slot) noexcept {
 	    "dispbar",     "gpprep",       "descwrite",    "descalloc",    "publishhot",
 	    "waitfinish",
 	    "waitdownload", "waitfault",   "waitoccl",     "staticdecode",
+	    "gpuidle",     "gpublocked",   "irqdelay",     "rw_eq",        "rw_sema",
+	    "rw_evf",      "rw_cond",      "rw_sleep",     "rw_mutex",     "rw_addr",
+	    "any_eq",      "any_condtimed", "served_reads", "unserved_reads", "serve_notgpu", "serve_gpubytes", "serve_wb", "fault_read", "fault_write",
+	    "asyncdl_wait",
 	};
 	static_assert(sizeof(names) / sizeof(names[0]) == SlotCount);
 	return names[static_cast<uint32_t>(slot)];
@@ -166,6 +192,17 @@ inline int LevelRef() noexcept {
 
 inline bool Enabled() noexcept {
 	return LevelRef() > 0;
+}
+
+// KYTY_PROBE_LITE=1 times only the coarse, low-frequency phases (GPU thread busy/idle, GPU
+// waits, faults, present) and writes frames.csv, without the per-draw scopes whose cost
+// (~10 ms/frame at level 1) distorts the frame. Level >= 1 implies lite.
+inline bool LiteEnabled() noexcept {
+	static const bool lite = [] {
+		const char* env = std::getenv("KYTY_PROBE_LITE");
+		return env != nullptr && *env == '1';
+	}();
+	return lite || Enabled();
 }
 
 inline int Level() noexcept {
@@ -212,6 +249,58 @@ public:
 	}
 	Scope(const Scope&)            = delete;
 	Scope& operator=(const Scope&) = delete;
+
+private:
+	Slot     m_slot;
+	uint64_t m_start;
+};
+
+// Coarse phase: timed in lite mode too. Only for sites hit a few hundred times per frame.
+class CoarseScope final {
+public:
+	explicit CoarseScope(Slot slot) noexcept : m_slot(slot), m_start(LiteEnabled() ? Now() : 0) {}
+	~CoarseScope() {
+		if (m_start != 0) {
+			Add(m_slot, Now() - m_start);
+		}
+	}
+	CoarseScope(const CoarseScope&)            = delete;
+	CoarseScope& operator=(const CoarseScope&) = delete;
+
+private:
+	Slot     m_slot;
+	uint64_t m_start;
+};
+
+// Instruction address of the guest/host access that raised the current GPU page fault.
+inline uint64_t& FaultRipRef() noexcept {
+	static thread_local uint64_t rip = 0;
+	return rip;
+}
+
+inline std::atomic<uint64_t>& FrameIndexRef() noexcept {
+	static std::atomic<uint64_t> index {0};
+	return index;
+}
+
+// Marks the guest thread that calls AgcSuspendPoint (the guest render thread).
+inline bool& RenderThreadRef() noexcept {
+	static thread_local bool render = false;
+	return render;
+}
+
+// Times a blocking guest API, but only on the guest render thread.
+class RenderWaitScope final {
+public:
+	explicit RenderWaitScope(Slot slot) noexcept
+	    : m_slot(slot), m_start(LiteEnabled() && RenderThreadRef() ? Now() : 0) {}
+	~RenderWaitScope() {
+		if (m_start != 0) {
+			Add(m_slot, Now() - m_start);
+		}
+	}
+	RenderWaitScope(const RenderWaitScope&)            = delete;
+	RenderWaitScope& operator=(const RenderWaitScope&) = delete;
 
 private:
 	Slot     m_slot;
@@ -370,6 +459,43 @@ inline std::string ProbeDir() noexcept {
 	return (env != nullptr && *env != '\0') ? std::string(env) : std::string(".");
 }
 
+// Event trace (lite mode): one line per rare event, buffered, in KYTY_PROBE_DIR/rb_trace.txt.
+// Each line starts with the frame index and a monotonic microsecond stamp.
+inline void Trace(const char* format, ...) noexcept {
+	if (!LiteEnabled()) {
+		return;
+	}
+	static std::mutex mutex;
+	static std::FILE* file = [] {
+		std::error_code ec;
+		std::filesystem::create_directories(ProbeDir(), ec);
+		const auto path = std::filesystem::path(ProbeDir()) / "rb_trace.txt";
+		std::FILE*  f   = std::fopen(path.string().c_str(), "w");
+		if (f != nullptr) {
+			std::setvbuf(f, nullptr, _IOFBF, 1 << 20);
+		}
+		return f;
+	}();
+	static uint32_t lines = 0;
+	if (file == nullptr) {
+		return;
+	}
+	std::lock_guard lock(mutex);
+	if (lines >= 400000) {
+		return;
+	}
+	std::fprintf(file, "%llu %llu ", static_cast<unsigned long long>(FrameIndexRef().load()),
+	             static_cast<unsigned long long>(Now() / 1000));
+	va_list args;
+	va_start(args, format);
+	std::vfprintf(file, format, args);
+	va_end(args);
+	std::fputc('\n', file);
+	if ((++lines & 255u) == 0) {
+		std::fflush(file);
+	}
+}
+
 inline void WriteFrameHeader(std::FILE* file) noexcept {
 	std::fprintf(file, "frame,wall_ms,mono_ns,frame_ms,fps,draws,slow,top_slot,top_ms");
 	for (uint32_t i = 0; i < SlotCount; i++) {
@@ -412,7 +538,9 @@ inline void OpenCsv() noexcept {
 
 // Called from the present thread after a guest frame is presented.
 inline void EndFrame() noexcept {
-	if (Level() < 1) {
+	// Counted in every mode: the served-read budget is per presented frame.
+	FrameIndexRef().fetch_add(1, std::memory_order_relaxed);
+	if (!LiteEnabled()) {
 		return;
 	}
 	static Snapshot prev {};

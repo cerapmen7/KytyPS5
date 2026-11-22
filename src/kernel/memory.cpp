@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/perfProbe.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -811,7 +812,9 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 		}
 		auto& buffers = GetGpuResources().GetBufferCache();
 		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
+			Common::PerfProbe::FaultRipRef() = 3; // trace tag: GPU-thread backing read
 			buffers.ReadMemory(vaddr, size);
+			Common::PerfProbe::FaultRipRef() = 0;
 		}
 	}
 	return TryReadBacking(vaddr, data, size);
@@ -862,6 +865,10 @@ void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 
 bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {
 	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
+}
+
+bool ServeGpuCpuOwnedRead(uint64_t vaddr, uint64_t size, void* out) noexcept {
+	return g_gpu_resources != nullptr && g_gpu_resources->TryReadCpuOwned(vaddr, size, out);
 }
 
 struct PrtAperture {

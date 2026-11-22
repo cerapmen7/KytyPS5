@@ -66,7 +66,7 @@ FaultManager::~FaultManager() {
 
 void FaultManager::ProcessFaultBuffer() {
 	if (const auto wait_tick = m_fault_areas[m_current_area]; wait_tick != 0) {
-		Common::PerfProbe::Scope wait(Common::PerfProbe::Slot::WaitFault);
+		Common::PerfProbe::CoarseScope wait(Common::PerfProbe::Slot::WaitFault);
 		m_scheduler.Wait(wait_tick);
 		m_scheduler.PopPendingOperations();
 	}

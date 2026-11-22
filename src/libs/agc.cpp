@@ -1524,8 +1524,9 @@ int KYTY_SYSV_ABI AgcSuspendPoint() {
 		Common::Sampler::RegisterThread("guest-render");
 		return true;
 	}();
+	Common::PerfProbe::RenderThreadRef() = true;
 	(void)registered;
-	if (Common::PerfProbe::Enabled()) {
+	if (Common::PerfProbe::LiteEnabled()) {
 		static uint64_t last_ns = 0;
 		const auto      begin   = Common::PerfProbe::Now();
 		g_renderer->GetGpu().SuspendPoint();

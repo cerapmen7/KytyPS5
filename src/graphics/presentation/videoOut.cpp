@@ -819,7 +819,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		bool guest_frame = false;
 		bool presented   = false;
 		{
-			Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Present);
+			Common::PerfProbe::CoarseScope probe(Common::PerfProbe::Slot::Present);
 			guest_frame = m_flip_queue.Flip();
 			presented   = guest_frame;
 			if (!presented && m_presenter.NeedsSystemOverlayRefresh()) {

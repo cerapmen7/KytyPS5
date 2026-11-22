@@ -1375,6 +1375,9 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
                                          const DrawRenderState& state, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source) {
 	Common::PerfProbe::Scope draw_probe(Common::PerfProbe::Slot::DrawTotal);
+	if (!Common::PerfProbe::Enabled() && Common::PerfProbe::LiteEnabled()) {
+		Common::PerfProbe::Add(Common::PerfProbe::Slot::DrawTotal, 0);
+	}
 	m_obtain_cache.Clear();
 	auto&      ucfg                     = buffer.GetUserConfig();
 	const bool primitive_restart_enable = state.primitive_restart_enable;

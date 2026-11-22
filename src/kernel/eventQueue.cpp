@@ -1,4 +1,5 @@
 #include "kernel/eventQueue.h"
+#include "common/perfProbe.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -166,6 +167,8 @@ bool KernelEqueuePrivate::GetNextTimerWaitMicros(uint64_t now_ns, uint32_t* wait
 }
 
 int KernelEqueuePrivate::WaitForEvents(KernelEvent* ev, int num, uint32_t micros) {
+	Common::PerfProbe::RenderWaitScope probe_wait(Common::PerfProbe::Slot::RwEq);
+	Common::PerfProbe::Scope probe_any(Common::PerfProbe::Slot::AnyEq);
 	Common::LockGuard lock(m_mutex);
 
 	EXIT_IF(num < 1);

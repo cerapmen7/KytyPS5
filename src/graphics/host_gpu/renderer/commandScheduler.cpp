@@ -76,12 +76,26 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 	return g_deferred_callback_scheduler != nullptr;
 }
 
+static bool EnvFlag(const char* name) {
+	const char* value = std::getenv(name);
+	return value != nullptr && *value == '1';
+}
+
+// Lab override of the cadence interval, in microseconds.
+static std::chrono::steady_clock::duration CadenceIntervalFromEnv() {
+	const char* value = std::getenv("KYTY_CADENCE_US");
+	if (value == nullptr || *value == '\0') {
+		return SubmitCadenceInterval;
+	}
+	return std::chrono::microseconds(std::strtoul(value, nullptr, 10));
+}
+
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics,
                                    bool submit_cadence)
     : m_master(graphics), m_context(context), m_graphics(graphics),
       m_command_pool(graphics, m_master), m_command(*this),
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }),
-      m_cadence(submit_cadence) {}
+      m_cadence(submit_cadence || EnvFlag("KYTY_SUBMIT_CADENCE"), CadenceIntervalFromEnv()) {}
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
@@ -208,8 +222,14 @@ void CommandScheduler::Finish() {
 		Submit();
 	}
 	{
-		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::WaitFinish);
+		Common::PerfProbe::CoarseScope probe(Common::PerfProbe::Slot::WaitFinish);
+		const auto begin = Common::PerfProbe::LiteEnabled() ? Common::PerfProbe::Now() : 0;
 		m_master.Wait(CurrentTick() - 1);
+		if (begin != 0) {
+			Common::PerfProbe::Trace("FINISH tick=%llu wait_us=%llu",
+			                         static_cast<unsigned long long>(CurrentTick() - 1),
+			                         static_cast<unsigned long long>((Common::PerfProbe::Now() - begin) / 1000));
+		}
 	}
 	BeginNext();
 	PopPendingOperations();
@@ -228,12 +248,12 @@ void CommandScheduler::Wait(uint64_t tick) {
 		}();
 		EXIT_IF(submitted_tick != tick);
 		{
-			Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::GpuWait);
+			Common::PerfProbe::CoarseScope probe(Common::PerfProbe::Slot::GpuWait);
 			m_master.Wait(tick);
 		}
 		BeginNext();
 	} else {
-		Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::GpuWait);
+		Common::PerfProbe::CoarseScope probe(Common::PerfProbe::Slot::GpuWait);
 		m_master.Wait(tick);
 	}
 }

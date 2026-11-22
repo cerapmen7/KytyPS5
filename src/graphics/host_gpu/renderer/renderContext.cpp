@@ -1,9 +1,14 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include <array>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/perfProbe.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "kernel/memory.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
@@ -68,6 +73,9 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (WaitWriteBacks(fault_vaddr, fault_size)) {
 		return true;
 	}
+	Common::PerfProbe::CoarseScope fault_probe(access == PageFaultAccess::Write
+	                                               ? Common::PerfProbe::Slot::FaultWrite
+	                                               : Common::PerfProbe::Slot::FaultRead);
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
@@ -78,10 +86,76 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	return true;
 }
 
+bool RenderContext::TryReadCpuOwned(uint64_t vaddr, uint64_t size, void* out) noexcept {
+	if (size == 0 || size > 64 || !IsMapped(vaddr, size)) {
+		return false;
+	}
+	// Same image rule as HandleFault: bytes under a pending image write-back are not current.
+	if (m_texture_cache.WriteBackTick(vaddr, size) != 0) {
+		Common::PerfProbe::Add(Common::PerfProbe::Slot::ServeWriteBack, 0);
+		return false;
+	}
+	// Runs on the faulting thread: the buffer cache's served-read mirror is thread-safe, so no
+	// GPU-thread round trip is needed (that round trip made the first prototype slower).
+	if (!m_buffer_cache.CanServeCpuRead(vaddr, size)) {
+		Common::PerfProbe::Add(Common::PerfProbe::Slot::ServeGpuBytes, 0);
+		return false;
+	}
+	// A page read far more often than a download costs falls back to one download, which leaves
+	// the page unprotected until the GPU writes it again.
+	constexpr uint64_t PageServeBudget = 512;
+	static std::array<std::atomic<uint64_t>, 4096> budget {};
+	const uint64_t frame = Common::PerfProbe::FrameIndexRef().load(std::memory_order_relaxed) &
+	                       ((uint64_t {1} << 40u) - 1u);
+	const uint64_t page  = vaddr >> 12u;
+	auto&          slot  = budget[(page * 0x9E3779B97F4A7C15ull) >> 52u];
+	uint64_t       value = slot.load(std::memory_order_relaxed);
+	for (;;) {
+		const bool     same  = (value >> 24u) == frame;
+		const uint64_t count = same ? (value & 0xffffffu) : 0;
+		if (count >= PageServeBudget) {
+			Common::PerfProbe::Add(Common::PerfProbe::Slot::ServeNotGpuPage, 0);
+			return false;
+		}
+		if (slot.compare_exchange_weak(value, (frame << 24u) | (count + 1),
+		                               std::memory_order_relaxed)) {
+			break;
+		}
+	}
+	return LibKernel::Memory::TryReadBacking(vaddr, out, size);
+}
+
 bool RenderContext::WaitWriteBacks(uint64_t vaddr, uint64_t size) {
 	const auto tick = m_texture_cache.WriteBackTick(vaddr, size);
 	if (tick == 0) {
 		return false;
+	}
+	static const bool wb_log = [] {
+		const char* value = std::getenv("KYTY_READBACK_LOG");
+		return value != nullptr && *value == '1';
+	}();
+	if (wb_log) {
+		static std::atomic<uint32_t> logged {0};
+		static FILE*                 log_file = std::fopen("writeback_log.txt", "w");
+		if (log_file != nullptr && logged.fetch_add(1) < 4000) {
+			std::fprintf(log_file, "WRITEBACK addr=0x%llx tick=%llu cur=%llu gpu_thread=%d\n",
+			             static_cast<unsigned long long>(vaddr),
+			             static_cast<unsigned long long>(tick),
+			             static_cast<unsigned long long>(m_command_scheduler.CurrentTick()),
+			             GuestGpu::IsGpuThread() ? 1 : 0);
+			std::fflush(log_file);
+		}
+	}
+	if (Common::PerfProbe::LiteEnabled()) {
+		auto& master = m_command_scheduler.GetMasterSemaphore();
+		master.Refresh();
+		Common::PerfProbe::Trace("WB rip=0x%llx addr=0x%llx gpu=%d cur=%llu known=%llu tick=%llu",
+		                         static_cast<unsigned long long>(Common::PerfProbe::FaultRipRef()),
+		                         static_cast<unsigned long long>(vaddr),
+		                         GuestGpu::IsGpuThread() ? 1 : 0,
+		                         static_cast<unsigned long long>(m_command_scheduler.CurrentTick()),
+		                         static_cast<unsigned long long>(master.KnownGpuTick()),
+		                         static_cast<unsigned long long>(tick));
 	}
 	// The GPU thread can fault inside a draw, so it submits without running deferred operations.
 	if (GuestGpu::IsGpuThread()) {

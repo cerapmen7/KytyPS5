@@ -1,4 +1,5 @@
 #include "kernel/syncOnAddress.h"
+#include "common/perfProbe.h"
 
 #include "common/threads.h"
 #include "libs/errno.h"
@@ -256,6 +257,7 @@ int WakePortable(volatile void* address, int32_t count) {
 template <typename T>
 int WaitImpl(volatile T* address, T expected, const WaitDeadline& deadline,
              signal_poll_func_t signal_poll) {
+	Common::PerfProbe::RenderWaitScope probe_wait(Common::PerfProbe::Slot::RwAddr);
 	if (!IsValidWaitAddress(address)) {
 		return KERNEL_ERROR_EINVAL;
 	}

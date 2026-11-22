@@ -1,4 +1,5 @@
 #include "kernel/pthread.h"
+#include "common/perfProbe.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -508,6 +509,7 @@ static void SchedulerBackoffOnce() {
 }
 
 static void SleepMicroWithSignalPoll(uint64_t microseconds) {
+	Common::PerfProbe::RenderWaitScope probe_wait(Common::PerfProbe::Slot::RwSleep);
 	if (microseconds == 0) {
 		KernelDispatchPendingSignalForCurrentThread();
 		return;
@@ -522,6 +524,7 @@ static void SleepMicroWithSignalPoll(uint64_t microseconds) {
 }
 
 static void SleepNanoWithSignalPoll(uint64_t nanoseconds) {
+	Common::PerfProbe::RenderWaitScope probe_wait(Common::PerfProbe::Slot::RwSleep);
 	if (nanoseconds == 0) {
 		KernelDispatchPendingSignalForCurrentThread();
 		return;
@@ -1746,6 +1749,7 @@ int KYTY_SYSV_ABI PthreadMutexDestroy(PthreadMutex* mutex) {
 
 int KYTY_SYSV_ABI PthreadMutexLock(PthreadMutex* mutex) {
 	// PRINT_NAME();
+	Common::PerfProbe::RenderWaitScope probe_wait(Common::PerfProbe::Slot::RwMutex);
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
@@ -2843,6 +2847,8 @@ int KYTY_SYSV_ABI PthreadCondSignalto(PthreadCond* cond, Pthread thread) {
 int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
                                        KernelUseconds usec) {
 	// PRINT_NAME();
+	Common::PerfProbe::RenderWaitScope probe_wait(Common::PerfProbe::Slot::RwCond);
+	Common::PerfProbe::Scope probe_any(Common::PerfProbe::Slot::AnyCondTimed);
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
@@ -2927,6 +2933,8 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex,
                                           const KernelTimespec* abstime) {
 	// PRINT_NAME();
+	Common::PerfProbe::RenderWaitScope probe_wait(Common::PerfProbe::Slot::RwCond);
+	Common::PerfProbe::Scope probe_any(Common::PerfProbe::Slot::AnyCondTimed);
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
@@ -3008,6 +3016,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 
 int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	PRINT_NAME();
+	Common::PerfProbe::RenderWaitScope probe_wait(Common::PerfProbe::Slot::RwCond);
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 

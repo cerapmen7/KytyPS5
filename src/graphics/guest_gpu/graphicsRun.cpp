@@ -250,6 +250,14 @@ void CommandProcessor::WaitForRewind(bool valid) {
 	}
 }
 
+static bool LabLogEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_READBACK_LOG");
+		return value != nullptr && *value == '1';
+	}();
+	return enabled;
+}
+
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func) {
 	switch (func) {
 		case 0: return true;
@@ -307,6 +315,14 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	}
 	if (dw_num == 0) {
 		return;
+	}
+	if (LabLogEnabled()) {
+		static std::atomic<uint32_t> lab_logged {0};
+		static FILE* lab_file = std::fopen("label_log.txt", "w");
+		if (lab_file != nullptr && lab_logged.fetch_add(1) < 20000) {
+			std::fprintf(lab_file, "WD addr=0x%llx dw=%u\n", static_cast<unsigned long long>(reinterpret_cast<uint64_t>(dst)), dw_num);
+			std::fflush(lab_file);
+		}
 	}
 
 	// Completion labels can be reused immediately; memcpy may write a destination twice.
@@ -444,6 +460,7 @@ void GuestGpu::ThreadRun(void* data) {
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
+				Common::PerfProbe::CoarseScope idle_probe(Common::PerfProbe::Slot::GpuIdle);
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
@@ -466,7 +483,10 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
-					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					{
+						Common::PerfProbe::CoarseScope blocked_probe(Common::PerfProbe::Slot::GpuBlocked);
+						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					}
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
 							queue.front().blocked = false;
@@ -529,7 +549,7 @@ void GuestGpu::ThreadRun(void* data) {
 }
 
 bool GuestGpu::Process(Submission& submission) {
-	Common::PerfProbe::Scope probe(Common::PerfProbe::Slot::Process);
+	Common::PerfProbe::CoarseScope probe(Common::PerfProbe::Slot::Process);
 	auto& cp = GetProcessor(submission.queue_id);
 
 	cp.BufferInit();
@@ -1168,6 +1188,15 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 	// downloads GPU-written bytes under the label before the store.
 	const auto write_label = [this, address](const void* value, uint64_t size) {
 		const auto vaddr   = reinterpret_cast<uint64_t>(address);
+		if (LabLogEnabled()) {
+			static std::atomic<uint32_t> lab_logged {0};
+			static FILE* lab_file = std::fopen("label_rm_log.txt", "w");
+			if (lab_file != nullptr && lab_logged.fetch_add(1) < 20000) {
+				std::fprintf(lab_file, "RM addr=0x%llx size=%llu\n", static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size));
+				std::fflush(lab_file);
+			}
+		}
+
 		auto&      buffers = m_renderer.GetBufferCache();
 		if (!GuestRange {vaddr, size}.Valid() || !buffers.IsRegionGpuModified(vaddr, size) ||
 		    buffers.HasGpuDirtyBytes(vaddr, size) ||
@@ -1196,9 +1225,32 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 	}
 
 	// GuestGpu::Process's end-of-slice flush submits the work this interrupt waits on.
-	if (interrupt) {
+	// Lab switch: deliver the interrupt when the packet is processed, like the label written
+	// just above. Guest reads of GPU-written bytes still go through the download-on-fault path.
+	static const bool early_irq = [] {
+		const char* value = std::getenv("KYTY_EARLY_IRQ");
+		return value != nullptr && *value == '1';
+	}();
+	if (interrupt && early_irq) {
+		Common::PerfProbe::Trace("IRQ early ctx=%u tick=%llu", interrupt_context_id,
+		                         static_cast<unsigned long long>(GetScheduler().CurrentTick()));
+		m_renderer.TriggerInterrupt(m_interrupt_event_id, interrupt_context_id);
+	} else if (interrupt) {
+		const auto irq_tick = GetScheduler().CurrentTick();
+		Common::PerfProbe::Trace("IRQ queue ctx=%u tick=%llu label=0x%llx", interrupt_context_id,
+		                         static_cast<unsigned long long>(irq_tick),
+		                         static_cast<unsigned long long>(reinterpret_cast<uint64_t>(address)));
 		GetScheduler().DeferPriorityOperation(
-		    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
+		    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id, irq_tick,
+		     queued = Common::PerfProbe::LiteEnabled() ? Common::PerfProbe::Now() : 0] {
+			    if (queued != 0) {
+				    const auto delay = Common::PerfProbe::Now() - queued;
+				    Common::PerfProbe::Add(Common::PerfProbe::Slot::IrqDelay, delay);
+				    Common::PerfProbe::Trace("IRQ fire ctx=%u tick=%llu delay_us=%llu",
+				                             interrupt_context_id,
+				                             static_cast<unsigned long long>(irq_tick),
+				                             static_cast<unsigned long long>(delay / 1000));
+			    }
 			    renderer.TriggerInterrupt(event_id, interrupt_context_id);
 		    });
 	}

@@ -237,7 +237,9 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 	}
 	auto& cache = context.GetBufferCache();
 	if (indirect_args != 0) {
+		Common::PerfProbe::FaultRipRef() = 1; // trace tag: dispatch-indirect args
 		cache.ReadMemory(indirect_args, sizeof(vk::DispatchIndirectCommand));
+		Common::PerfProbe::FaultRipRef() = 0;
 		std::memcpy(input.workgroup_counts, reinterpret_cast<const void*>(indirect_args),
 		            sizeof(input.workgroup_counts));
 	}

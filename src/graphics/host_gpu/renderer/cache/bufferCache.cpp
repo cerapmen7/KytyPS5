@@ -243,6 +243,10 @@ BufferCache::PendingDownload BufferCache::CollectDownloadCopies(const Buffer& bu
                                                                 uint64_t vaddr, uint64_t size) {
 	PendingDownload pending;
 	pending.buffer_address = buffer.CpuAddress();
+	const bool                                 serve = ServeCpuReadsEnabled();
+	std::vector<std::pair<uint64_t, uint64_t>> cleared;
+	uint64_t                                   serve_begin = UINT64_MAX;
+	uint64_t                                   serve_end   = 0;
 	m_memory_tracker.ForEachDownloadRange<false>(
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
@@ -252,12 +256,84 @@ BufferCache::PendingDownload BufferCache::CollectDownloadCopies(const Buffer& bu
 			                                end - start);
 			    // Start each packed range on its own 64-byte cache line.
 			    pending.total_size += Common::AlignUp(end - start, DownloadCopyAlignment);
+			    serve_begin = std::min(serve_begin, start);
+			    serve_end   = std::max(serve_end, end);
 		    });
 		    m_gpu_modified_ranges.Subtract(address, bytes);
+		    if (serve) {
+			    cleared.emplace_back(address, bytes);
+		    }
 		    ForgetColorMetadataChecks(address, bytes);
 		    SupersedePublishes(address, bytes);
 	    });
+	if (serve && !cleared.empty()) {
+		// The collected bytes leave the dirty mirror and enter the in-flight list in one step,
+		// so a concurrent served read never sees them as clean before they are published.
+		std::unique_lock lock(m_serve_mutex);
+		if (!pending.copies.empty()) {
+			pending.serve_id = m_serve_next_id++;
+			m_serve_inflight.push_back({serve_begin, serve_end, pending.serve_id});
+		}
+		for (const auto& [address, bytes]: cleared) {
+			m_serve_dirty.Subtract(address, bytes);
+		}
+	}
 	return pending;
+}
+
+bool BufferCache::ServeCpuReadsEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SERVE_CPU_READS");
+		return value != nullptr && *value == '1';
+	}();
+	return enabled;
+}
+
+void BufferCache::ServeMarkDirty(uint64_t vaddr, uint64_t size) {
+	if (!ServeCpuReadsEnabled()) {
+		return;
+	}
+	std::unique_lock lock(m_serve_mutex);
+	m_serve_dirty.Add(vaddr, size);
+}
+
+void BufferCache::ServeClearDirty(uint64_t vaddr, uint64_t size) {
+	if (!ServeCpuReadsEnabled()) {
+		return;
+	}
+	std::unique_lock lock(m_serve_mutex);
+	m_serve_dirty.Subtract(vaddr, size);
+}
+
+void BufferCache::ServeEndInflight(uint64_t id) {
+	if (id == 0) {
+		return;
+	}
+	std::unique_lock lock(m_serve_mutex);
+	std::erase_if(m_serve_inflight, [id](const ServeInflight& entry) { return entry.id == id; });
+}
+
+bool BufferCache::CanServeCpuRead(uint64_t vaddr, uint64_t size) const {
+	if (!ServeCpuReadsEnabled() || size == 0 || size > UINT64_MAX - vaddr) {
+		return false;
+	}
+	constexpr uint64_t HostPage = 0x1000;
+	const auto         end      = vaddr + size;
+	std::shared_lock   lock(m_serve_mutex);
+	if (m_serve_dirty.Intersects(vaddr, size)) {
+		return false;
+	}
+	for (const auto& entry: m_serve_inflight) {
+		if (entry.begin < end && vaddr < entry.end) {
+			return false;
+		}
+	}
+	// Only reads that fault because of GPU-written bytes on their page are served; any other
+	// protected page keeps the normal fault path.
+	const auto first_page = Common::AlignDown(vaddr, HostPage);
+	const auto last_page  = Common::AlignDown(end - 1, HostPage);
+	return m_serve_dirty.Intersects(first_page, HostPage) ||
+	       (last_page != first_page && m_serve_dirty.Intersects(last_page, HostPage));
 }
 
 /// Reserves download memory for all the pending copies at once, from the stream buffer or from a
@@ -316,6 +392,7 @@ void BufferCache::PublishDownload(const PendingDownload& pending) {
 		                                      pending.mapped + (copy.dstOffset - pending.offset),
 		                                      copy.size);
 	}
+	ServeEndInflight(pending.serve_id);
 }
 
 template <bool async>
@@ -334,7 +411,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	} else {
 		const auto tick = m_scheduler.CurrentTick();
 		{
-			Common::PerfProbe::Scope wait(Common::PerfProbe::Slot::WaitDownload);
+			Common::PerfProbe::CoarseScope wait(Common::PerfProbe::Slot::WaitDownload);
 			m_scheduler.Wait(tick);
 		}
 		m_scheduler.WaitPriorityOperations(tick);
@@ -486,7 +563,7 @@ bool BufferCache::DownloadWithHotBuffers(BufferId main_id, Buffer& buffer, uint6
 	}
 	const auto tick = m_scheduler.CurrentTick();
 	{
-		Common::PerfProbe::Scope wait(Common::PerfProbe::Slot::WaitDownload);
+		Common::PerfProbe::CoarseScope wait(Common::PerfProbe::Slot::WaitDownload);
 		m_scheduler.Wait(tick);
 	}
 	m_scheduler.WaitPriorityOperations(tick);
@@ -494,10 +571,176 @@ bool BufferCache::DownloadWithHotBuffers(BufferId main_id, Buffer& buffer, uint6
 		PublishDownload(item.pending);
 	}
 	for (size_t index = 1; index < batch.size(); ++index) {
-		m_memory_tracker.UnmarkRegionAsGpuModified(batch[index].unmark_address,
-		                                           batch[index].unmark_size);
+		UnmarkCleanPages(batch[index].unmark_address, batch[index].unmark_size);
 	}
 	return true;
+}
+
+bool BufferCache::AsyncReadbacksEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_ASYNC_READBACK");
+		return value != nullptr && *value == '1';
+	}();
+	return enabled;
+}
+
+std::shared_ptr<BufferCache::AsyncReadback> BufferCache::FindAsyncReadback(uint64_t vaddr,
+                                                                           uint64_t size) const {
+	// Whole tracker pages: a page is unprotected as a unit.
+	const auto first = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto last  = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	for (const auto& state: m_async_readbacks) {
+		const auto begin = Common::AlignDown(state->start, TRACKER_PAGE_SIZE);
+		const auto end   = Common::AlignUp(state->start + state->size, TRACKER_PAGE_SIZE);
+		if (begin < last && first < end) {
+			return state;
+		}
+	}
+	return nullptr;
+}
+
+bool BufferCache::AsyncReadbackIntersects(uint64_t vaddr, uint64_t size) const {
+	return !m_async_readbacks.empty() && FindAsyncReadback(vaddr, size) != nullptr;
+}
+
+void BufferCache::FinishAsyncReadback(const std::shared_ptr<AsyncReadback>& state) {
+	{
+		std::unique_lock lock(state->mutex);
+		state->published.wait(lock, [&] { return state->done; });
+	}
+	const auto it = std::ranges::find(m_async_readbacks, state);
+	if (it == m_async_readbacks.end()) {
+		return;
+	}
+	m_async_readbacks.erase(it);
+	UnmarkCleanPages(state->start, state->size);
+}
+
+void BufferCache::UnmarkCleanPages(uint64_t vaddr, uint64_t size) {
+	if (size == 0) {
+		return;
+	}
+	const auto first     = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto last      = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	uint64_t   run_start = 0;
+	uint64_t   run_size  = 0;
+	const auto flush_run = [&] {
+		if (run_size != 0) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(run_start, run_size);
+			run_size = 0;
+		}
+	};
+	// Consecutive clean pages are unprotected together, as the single-range unmark did before.
+	for (auto page = first; page < last; page += TRACKER_PAGE_SIZE) {
+		const bool clean = !m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE) &&
+		                   !AsyncReadbackIntersects(page, TRACKER_PAGE_SIZE);
+		if (!clean) {
+			flush_run();
+			continue;
+		}
+		if (run_size == 0) {
+			run_start = page;
+		}
+		run_size += TRACKER_PAGE_SIZE;
+	}
+	flush_run();
+}
+
+bool BufferCache::ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write) {
+	std::shared_ptr<AsyncReadback> state;
+	bool                           owner   = false;
+	bool                           handled = false;
+	uint64_t                       dirty   = 0;
+	auto&                          gpu     = m_scheduler.Context().GetGpu();
+	const uint64_t                 t0      = Common::PerfProbe::LiteEnabled() ? Common::PerfProbe::Now() : 0;
+	gpu.SendCommandSync([&] {
+		if (is_write && !IsRegionRegistered(vaddr, size)) {
+			handled = true;
+			return;
+		}
+		// Another guest thread's download already covers this page: wait for the same publish.
+		if (auto existing = FindAsyncReadback(vaddr, size)) {
+			state = std::move(existing);
+			return;
+		}
+		if (!IsRegionGpuModified(vaddr, size)) {
+			if (is_write) {
+				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+				QueueBdaSync(vaddr, size, true);
+			}
+			handled = true;
+			return;
+		}
+		const auto buffer_id = FindBuffer(vaddr, size);
+		auto&      buffer    = m_slot_buffers[buffer_id];
+		static const uint64_t download_window =
+		    LabEnv("KYTY_DOWNLOAD_WINDOW", DefaultDownloadWindowSize);
+		const auto start = std::max(Common::AlignDown(vaddr, download_window), buffer.CpuAddress());
+		const auto end   = std::min(std::max(start + download_window, vaddr + size),
+		                            buffer.CpuAddress() + buffer.Size());
+		auto pending = CollectDownloadCopies(buffer, start, end - start);
+		if (pending.copies.empty()) {
+			return; // Unusual tracker state: leave it to the synchronous path.
+		}
+		dirty = pending.total_size;
+		PendingDownload* const items[] = {&pending};
+		ReserveDownloadMemory(items);
+		RecordDownload(buffer, pending);
+		state                 = std::make_shared<AsyncReadback>();
+		state->start          = start;
+		state->size           = end - start;
+		state->buffer_address = buffer.CpuAddress();
+		state->buffer_size    = buffer.Size();
+		m_async_readbacks.push_back(state);
+		owner = true;
+		// Queued before the flush so the operation's tick is the command buffer holding the copy.
+		m_scheduler.DeferPriorityOperation([this, state, pending = std::move(pending)] {
+			PublishDownload(pending);
+			{
+				std::lock_guard lock(state->mutex);
+				state->done = true;
+			}
+			state->published.notify_all();
+		});
+		m_scheduler.Flush();
+	});
+	if (handled) {
+		return true;
+	}
+	if (!state) {
+		return false;
+	}
+	{
+		Common::PerfProbe::CoarseScope wait(Common::PerfProbe::Slot::AsyncDlWait);
+		std::unique_lock lock(state->mutex);
+		state->published.wait(lock, [&] { return state->done; });
+	}
+	bool fallback = false;
+	gpu.SendCommandSync([&] {
+		FinishAsyncReadback(state);
+		if (owner) {
+			NoteHotReadback(state->buffer_address, state->buffer_size);
+			NoteReadHot(vaddr, size);
+		}
+		if (is_write) {
+			// Rewritten by the GPU meanwhile: the synchronous path downloads it again.
+			if (IsRegionGpuModified(vaddr, size)) {
+				fallback = true;
+				return;
+			}
+			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+			QueueBdaSync(vaddr, size, true);
+		}
+	});
+	if (t0 != 0) {
+		Common::PerfProbe::Trace("RBA %s owner=%d addr=0x%llx dirty=%llu us=%llu fallback=%d",
+		                         is_write ? "w" : "r", owner ? 1 : 0,
+		                         static_cast<unsigned long long>(vaddr),
+		                         static_cast<unsigned long long>(dirty),
+		                         static_cast<unsigned long long>((Common::PerfProbe::Now() - t0) / 1000),
+		                         fallback ? 1 : 0);
+	}
+	return !fallback;
 }
 
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
@@ -570,13 +813,61 @@ void BufferCache::NoteRecentWrite(uint64_t address, uint64_t size) {
 	}
 }
 
+// Lab trace tag for GPU writes: 0 = shader binding, 1 = DMA fill, 2 = DMA copy (3 = copy with a
+// GPU-written source).
+static thread_local int g_write_source = 0;
+
+void BufferCache::NoteWriteTick(uint64_t vaddr, uint64_t size) {
+	if (!Common::PerfProbe::LiteEnabled() || size == 0) {
+		return;
+	}
+	if (!m_write_ticks) {
+		m_write_ticks = std::make_unique<WriteTickEntry[]>(WriteTickSlots);
+	}
+	const auto tick  = m_scheduler.CurrentTick();
+	const auto first = vaddr >> 12u;
+	const auto last  = std::min((vaddr + size - 1) >> 12u, first + 4095);
+	for (auto page = first; page <= last; ++page) {
+		m_write_ticks[page & (WriteTickSlots - 1)] = {page, tick};
+	}
+}
+
+uint64_t BufferCache::MaxWriteTick(uint64_t vaddr, uint64_t size) const {
+	if (!m_write_ticks || size == 0) {
+		return 0;
+	}
+	uint64_t   tick  = 0;
+	const auto first = vaddr >> 12u;
+	const auto last  = std::min((vaddr + size - 1) >> 12u, first + 4095);
+	for (auto page = first; page <= last; ++page) {
+		const auto& entry = m_write_ticks[page & (WriteTickSlots - 1)];
+		if (entry.page == page) {
+			tick = std::max(tick, entry.tick);
+		}
+	}
+	return tick;
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
+	const uint64_t fault_rip     = Common::PerfProbe::FaultRipRef();
+	const bool     gpu_caller    = GuestGpu::IsGpuThread();
+	const bool     render_caller = Common::PerfProbe::RenderThreadRef();
+	if (!gpu_caller && AsyncReadbacksEnabled() && ReadMemoryAsync(vaddr, size, is_write)) {
+		return;
+	}
+	const uint64_t queued_ns     = Common::PerfProbe::LiteEnabled() ? Common::PerfProbe::Now() : 0;
+	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, fault_rip,
+	                                                gpu_caller, render_caller, queued_ns] {
+		// An asynchronous download over these pages holds bytes that are no longer in the dirty
+		// set: wait for its publish (this blocks the GPU thread, as every sync download does).
+		while (auto inflight = FindAsyncReadback(vaddr, size)) {
+			FinishAsyncReadback(inflight);
+		}
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
@@ -589,12 +880,65 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			    std::max(Common::AlignDown(vaddr, download_window), buffer.CpuAddress());
 			const auto end = std::min(std::max(start + download_window, vaddr + size),
 			                          buffer.CpuAddress() + buffer.Size());
+			const bool     lite       = Common::PerfProbe::LiteEnabled();
+			uint64_t       trace_t0   = 0;
+			uint64_t       known_tick = 0;
+			uint64_t       wtick_page = 0;
+			uint64_t       wtick_win  = 0;
+			uint64_t       dirty      = 0;
+			uint64_t       cur_tick   = 0;
+			int            hit        = 0;
+			char           ranges[160] {};
+			if (lite) {
+				auto& master = m_scheduler.GetMasterSemaphore();
+				master.Refresh();
+				known_tick = master.KnownGpuTick();
+				cur_tick   = m_scheduler.CurrentTick();
+				wtick_page = MaxWriteTick(vaddr, size);
+				wtick_win  = MaxWriteTick(start, end - start);
+				dirty      = EstimateDownloadBytes(start, end - start);
+				// Does the access itself touch GPU-written bytes (32-byte span), or only its page?
+				hit        = m_gpu_modified_ranges.Intersects(vaddr, 32) ? 1 : 0;
+				size_t     pos   = 0;
+				int        shown = 0;
+				const auto base  = Common::AlignDown(vaddr, uint64_t {0x4000});
+				m_gpu_modified_ranges.ForEachInRange(base, 0x4000, [&](uint64_t begin, uint64_t finish) {
+					if (shown++ < 4 && pos < sizeof(ranges) - 40) {
+						pos += static_cast<size_t>(std::snprintf(
+						    ranges + pos, sizeof(ranges) - pos, "%llx-%llx,",
+						    static_cast<unsigned long long>(std::max(begin, base) - base),
+						    static_cast<unsigned long long>(std::min(finish, base + 0x4000) - base)));
+					}
+				});
+				trace_t0 = Common::PerfProbe::Now();
+			}
 			const bool downloaded =
 			    m_batch_hot_readbacks
 			        ? DownloadWithHotBuffers(buffer_id, buffer, start, end - start)
 			        : DownloadBufferMemory<false>(buffer, start, end - start);
+			if (lite) {
+				Common::PerfProbe::Trace(
+				    "RB %s rt=%d hit=%d q_us=%llu rng=%s rip=0x%llx addr=0x%llx size=%llu "
+				    "win=0x%llx+0x%llx buf=0x%llx+0x%llx "
+				    "dirty=%llu dl=%d cur=%llu known=%llu wpage=%llu wwin=%llu us=%llu",
+				    gpu_caller ? "gpu" : (is_write ? "cpuw" : "cpur"), render_caller ? 1 : 0, hit,
+				    static_cast<unsigned long long>((trace_t0 - queued_ns) / 1000),
+				    ranges[0] != '\0' ? ranges : "-",
+				    static_cast<unsigned long long>(fault_rip),
+				    static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size),
+				    static_cast<unsigned long long>(start),
+				    static_cast<unsigned long long>(end - start),
+				    static_cast<unsigned long long>(buffer.CpuAddress()),
+				    static_cast<unsigned long long>(buffer.Size()),
+				    static_cast<unsigned long long>(dirty), downloaded ? 1 : 0,
+				    static_cast<unsigned long long>(cur_tick),
+				    static_cast<unsigned long long>(known_tick),
+				    static_cast<unsigned long long>(wtick_page),
+				    static_cast<unsigned long long>(wtick_win),
+				    static_cast<unsigned long long>((Common::PerfProbe::Now() - trace_t0) / 1000));
+			}
 			if (downloaded) {
-				m_memory_tracker.UnmarkRegionAsGpuModified(start, end - start);
+				UnmarkCleanPages(start, end - start);
 				NoteHotReadback(buffer.CpuAddress(), buffer.Size());
 				NoteReadHot(vaddr, size);
 			}
@@ -750,6 +1094,7 @@ void BufferCache::ConfirmPublish(const std::shared_ptr<PublishBatch>& batch) {
 			continue;
 		}
 		m_gpu_modified_ranges.Subtract(entry.vaddr, entry.size);
+		ServeClearDirty(entry.vaddr, entry.size);
 		ForgetColorMetadataChecks(entry.vaddr, entry.size);
 	}
 	for (const auto& entry: *batch) {
@@ -760,6 +1105,7 @@ void BufferCache::ConfirmPublish(const std::shared_ptr<PublishBatch>& batch) {
 		for (auto page = Common::AlignDown(entry.vaddr, TRACKER_PAGE_SIZE); page < last;
 		     page += TRACKER_PAGE_SIZE) {
 			if (!m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE) &&
+			    !AsyncReadbackIntersects(page, TRACKER_PAGE_SIZE) &&
 			    m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE)) {
 				m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
 			}
@@ -976,9 +1322,19 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
+		if (Common::PerfProbe::LiteEnabled() && size <= 256 &&
+		    (Common::PerfProbe::FrameIndexRef().load(std::memory_order_relaxed) % 50) == 0) {
+			Common::PerfProbe::Trace("GW src=%d addr=0x%llx size=%llu was_dirty=%d tick=%llu",
+			                         g_write_source, static_cast<unsigned long long>(vaddr),
+			                         static_cast<unsigned long long>(size),
+			                         m_gpu_modified_ranges.Intersects(vaddr, size) ? 1 : 0,
+			                         static_cast<unsigned long long>(m_scheduler.CurrentTick()));
+		}
 		m_gpu_modified_ranges.Add(vaddr, size);
+		ServeMarkDirty(vaddr, size);
 		ForgetColorMetadataChecks(vaddr, size);
 		NoteRecentWrite(vaddr, size);
+		NoteWriteTick(vaddr, size);
 		SupersedePublishes(vaddr, size);
 		m_hot_ranges.ForEachInRange(vaddr, size, [this](uint64_t start, uint64_t end) {
 			m_publish_ranges.Add(start, end - start);
@@ -1033,7 +1389,9 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	}
 
 	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
+	g_write_source         = 1;
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
+	g_write_source         = 0;
 	dst->Fill(dst_offset, size, value);
 }
 
@@ -1072,10 +1430,27 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	}
 	const auto src_id      = src_memory ? FindBuffer(src_vaddr, size) : BufferId {};
 	const auto dst_id      = dst_memory ? FindBuffer(dst_vaddr, size) : BufferId {};
+	g_write_source = (src_memory && IsRegionGpuModified(src_vaddr, size)) ? 3 : 2;
+	if (src_gds) {
+		g_write_source = 4;
+	}
+	if (Common::PerfProbe::LiteEnabled() && size <= 256 &&
+	    (Common::PerfProbe::FrameIndexRef().load(std::memory_order_relaxed) % 50) == 0) {
+		Common::PerfProbe::Trace("GC dst=0x%llx src=0x%llx size=%llu dst_gpu=%d src_gpu=%d "
+		                         "src_dirty=%d",
+		                         static_cast<unsigned long long>(dst_vaddr),
+		                         static_cast<unsigned long long>(src_vaddr),
+		                         static_cast<unsigned long long>(size),
+		                         dst_memory && IsRegionGpuModified(dst_vaddr, size) ? 1 : 0,
+		                         src_memory && IsRegionGpuModified(src_vaddr, size) ? 1 : 0,
+		                         src_memory && m_gpu_modified_ranges.Intersects(src_vaddr, size) ? 1
+		                                                                                         : 0);
+	}
 	auto [src, src_offset] = src_memory ? ObtainBuffer(src_vaddr, size, false, true, src_id)
 	                                    : std::pair {&m_gds_buffer, src_vaddr};
 	auto [dst, dst_offset] = dst_memory ? ObtainBuffer(dst_vaddr, size, true, true, dst_id)
 	                                    : std::pair {&m_gds_buffer, dst_vaddr};
+	g_write_source         = 0;
 	dst->CopyFrom(command, *src, src_offset, dst_offset, size);
 }
 
@@ -1172,7 +1547,8 @@ void BufferCache::RunGarbageCollector() {
 	// Publish all queued downloads before releasing their tracked pages and owners.
 	const auto completion_tick = m_scheduler.CurrentTick();
 	{
-		Common::PerfProbe::Scope wait(Common::PerfProbe::Slot::WaitDownload);
+		Common::PerfProbe::CoarseScope wait(Common::PerfProbe::Slot::WaitDownload);
+		Common::PerfProbe::Trace("GCDL buffers=%zu", dirty_buffers.size());
 		m_scheduler.Wait(completion_tick);
 	}
 	m_scheduler.WaitPriorityOperations(completion_tick);

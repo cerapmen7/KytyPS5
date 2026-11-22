@@ -1,4 +1,5 @@
 #include "kernel/semaphore.h"
+#include "common/perfProbe.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -277,6 +278,7 @@ int KYTY_SYSV_ABI KernelDeleteSema(KernelSema sem) {
 }
 
 int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time) {
+	Common::PerfProbe::RenderWaitScope probe_wait(Common::PerfProbe::Slot::RwSema);
 	if (sem == nullptr) {
 		return KERNEL_ERROR_ESRCH;
 	}

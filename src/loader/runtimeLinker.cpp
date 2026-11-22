@@ -31,6 +31,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include "common/perfProbe.h"
 #include <cstring>
 #include <fmt/format.h>
 #include <magic_enum.hpp>
@@ -667,7 +668,37 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
 		}
-		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+		// A read of bytes the GPU never wrote, on a page it did write, is served from the
+		// backing without downloading the page (which waits for all queued GPU work).
+		// Same switch as BufferCache::ServeCpuReadsEnabled, which keeps the served-read mirror.
+		static const bool serve_cpu_reads = [] {
+			const char* value = std::getenv("KYTY_SERVE_CPU_READS");
+			return value != nullptr && *value == '1';
+		}();
+		if (access == GpuAccess::Read && serve_cpu_reads) {
+			uint32_t mnemonic = 0;
+			if (Loader::X64InstructionEmulator::TryEmulateServedLoad(
+			        info->native_context, info->access_violation_vaddr,
+			        &Libs::LibKernel::Memory::ServeGpuCpuOwnedRead, &mnemonic)) {
+				Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
+				if (Common::PerfProbe::LiteEnabled()) {
+					Common::PerfProbe::Add(Common::PerfProbe::Slot::ServedReads, 0);
+				}
+				return true;
+			}
+			if (Common::PerfProbe::LiteEnabled()) {
+				Common::PerfProbe::Add(Common::PerfProbe::Slot::UnservedReads, 0);
+				Common::PerfProbe::Trace(
+				    "UNSERVED rip=0x%llx addr=0x%llx mnemonic=%u",
+				    static_cast<unsigned long long>(info->exception_address),
+				    static_cast<unsigned long long>(info->access_violation_vaddr), mnemonic);
+			}
+		}
+		Common::PerfProbe::FaultRipRef() = info->exception_address;
+		const bool handled =
+		    Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr);
+		Common::PerfProbe::FaultRipRef() = 0;
+		if (handled) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 			return true;
 		}
